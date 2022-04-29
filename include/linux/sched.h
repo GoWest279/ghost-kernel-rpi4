@@ -8,7 +8,6 @@
  */
 
 #include <uapi/linux/sched.h>
-#include <uapi/linux/ghost.h>
 
 #include <asm/current.h>
 
@@ -589,7 +588,6 @@ struct sched_dl_entity {
 struct ghost_queue;
 struct ghost_status_word;
 struct ghost_enclave;
-struct timerfd_ghost;
 
 struct sched_ghost_entity {
 	struct list_head run_list;
@@ -599,6 +597,8 @@ struct sched_ghost_entity {
 	struct ghost_queue *dst_q;
 	struct ghost_status_word *status_word;
 	struct ghost_enclave *enclave;
+	/* See ghost_destroy_enclave() */
+	struct ghost_enclave *__agent_decref_enclave;
 
 	/*
 	 * See also ghost_prepare_task_switch() and ghost_deferred_msgs()
@@ -644,8 +644,15 @@ struct sched_ghost_entity {
 	struct rcu_head rcu;
 };
 
+struct __kernel_timerfd_ghost {
+	bool enabled;
+	int cpu;
+	uint64_t type;
+	uint64_t cookie;
+};
+
 extern void ghost_commit_greedy_txn(void);
-extern void ghost_timerfd_triggered(struct timerfd_ghost *timer);
+extern void ghost_timerfd_triggered(struct __kernel_timerfd_ghost *timer);
 
 #endif
 
@@ -768,6 +775,8 @@ struct task_struct {
 	struct sched_rt_entity		rt;
 #ifdef CONFIG_SCHED_CLASS_GHOST
 	int64_t gtid;			/* ghost tid */
+	uint inhibit_task_msgs;		/* don't produce msgs for this task */
+	struct list_head inhibited_task_list;
 	struct sched_ghost_entity ghost;
 #endif
 #ifdef CONFIG_CGROUP_SCHED

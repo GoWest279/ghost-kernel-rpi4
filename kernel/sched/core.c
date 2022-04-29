@@ -10,7 +10,6 @@
 #include <trace/events/sched.h>
 #undef CREATE_TRACE_POINTS
 
-#include "ghost.h"
 #include "sched.h"
 
 #include <linux/nospec.h>
@@ -3689,6 +3688,8 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->rt.on_list		= 0;
 
 #ifdef CONFIG_SCHED_CLASS_GHOST
+	p->inhibit_task_msgs = 0;
+	INIT_LIST_HEAD(&p->inhibited_task_list);
 	sched_ghost_entity_init(p);
 #endif
 
@@ -4238,130 +4239,6 @@ static inline void kmap_local_sched_in(void)
 #endif
 }
 
-#ifdef CONFIG_SCHED_CLASS_GHOST
-#include <uapi/linux/ghost.h>
-static inline void ghost_prepare_task_switch(struct rq *rq,
-					     struct task_struct *prev,
-					     struct task_struct *next)
-{
-	struct ghost_status_word *agent_sw;
-
-	if (rq->ghost.agent) {
-		/*
-		 * XXX pick_next_task_fair() can return 'rq->idle' via
-		 * core_tag_pick_next_matching_rendezvous().
-		*/
-		agent_sw = rq->ghost.agent->ghost.status_word;
-		if (!task_has_ghost_policy(next) && next != rq->idle) {
-			ghost_sw_clear_flag(agent_sw, GHOST_SW_CPU_AVAIL);
-			if (rq->ghost.run_flags & NEED_CPU_NOT_IDLE) {
-				rq->ghost.run_flags &= ~NEED_CPU_NOT_IDLE;
-				ghost_need_cpu_not_idle(rq, next);
-			}
-		} else {
-			ghost_sw_set_flag(agent_sw, GHOST_SW_CPU_AVAIL);
-		}
-	}
-
-	if (!task_has_ghost_policy(prev))
-		goto done;
-
-	/* Who watches the watchmen? */
-	if (prev == rq->ghost.agent)
-		goto done;
-
-	/*
-	 * An oncpu task may switch into ghost (e.g. via a third party calling
-	 * sched_setscheduler(2)) while the rq->lock is dropped in one of the
-	 * pick_next_task handlers (e.g. during CFS idle load balancing).
-	 *
-	 * It is not possible to distinguish this in switched_to_ghost() so
-	 * we resolve 'prev->ghost.new_task' here. Failing to do this has
-	 * dire consequences if 'prev' is runnable since it will languish
-	 * in the kernel forever (in contrast to a blocked task there is
-	 * no trigger forthcoming to produce a TASK_NEW in the future).
-	 */
-	if (unlikely(prev->ghost.new_task)) {
-		WARN_ON_ONCE(prev->ghost.yield_task);
-		WARN_ON_ONCE(prev->ghost.blocked_task);
-
-		/*
-		 * We just produced TASK_NEW so no need to consider 'prev' for
-		 * a preemption edge (see ghost_produce_prev_msgs for details).
-		 */
-		rq->ghost.check_prev_preemption = false;
-
-		prev->ghost.new_task = false;
-		ghost_task_new(rq, prev);
-		ghost_wake_agent_of(prev);
-	}
-
-	/* If we're on the ghost.tasks list, then we're runnable. */
-	if (!list_empty(&prev->ghost.run_list)) {
-		/*
-		 * Keep ghost.tasks sorted by last_runnable_at.  Whenever we set
-		 * the time, we append to the tail.
-		 */
-		list_del_init(&prev->ghost.run_list);
-		list_add_tail(&prev->ghost.run_list, &rq->ghost.tasks);
-		prev->ghost.last_runnable_at = ktime_get();
-	}
-
-	if (rq->ghost.check_prev_preemption) {
-		rq->ghost.check_prev_preemption = false;
-		ghost_task_preempted(rq, prev);
-		ghost_wake_agent_of(prev);
-	}
-
-done:
-	/*
-	 * Clear the ONCPU bit after producing the task state change msg
-	 * (e.g. preempted). This guarantees that when a task is offcpu
-	 * its 'task_barrier' is stable.
-	 */
-	if (task_has_ghost_policy(prev)) {
-		struct ghost_status_word *prev_sw = prev->ghost.status_word;
-		WARN_ON_ONCE(!(prev_sw->flags & GHOST_SW_TASK_ONCPU));
-		ghost_sw_clear_flag(prev_sw, GHOST_SW_TASK_ONCPU);
-	}
-
-	/*
-	 * CPU is switching to a non-ghost task while a task is latched.
-	 *
-	 * Treat this like latched_task preemption because we don't know when
-	 * the CPU will be available again so no point in keeping it latched.
-	 */
-	if (rq->ghost.latched_task) {
-		/*
-		 * If 'next' was returned from pick_next_task_ghost() then
-		 * 'latched_task' must have been cleared. Conversely if
-		 * there is 'latched_task' then 'next' could not have
-		 * been returned from pick_next_task_ghost().
-		 */
-		WARN_ON_ONCE(task_has_ghost_policy(next) &&
-			     !is_agent(rq, next));
-		ghost_latched_task_preempted(rq);
-
-		/*
-		 * XXX the WARN above is susceptible to a false-negative
-		 * when pick_next_task_ghost returns the idle task. This
-		 * is not the common case but it highlights that what we
-		 * really need to check is the sched_class that produced
-		 * 'next'.
-		 */
-	}
-
-	if (task_has_ghost_policy(next) && !is_agent(rq, next))
-		ghost_task_got_oncpu(rq, next);
-
-	/*
-	 * The last task in the chain scheduled (blocked/yielded/preempted).
-	 */
-	if (rq->ghost.switchto_count < 0)
-		rq->ghost.switchto_count = 0;
-}
-#endif /* CONFIG_SCHED_CLASS_GHOST */
-
 /**
  * prepare_task_switch - prepare to switch tasks
  * @rq: the runqueue preparing to switch
@@ -4539,7 +4416,7 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 /*
  * context_switch - switch to the new MM and the new thread's register state.
  */
-noinline struct rq *
+static noinline struct rq *
 context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next, struct rq_flags *rf)
 {
@@ -5154,12 +5031,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	struct task_struct *p;
 
 #ifdef CONFIG_SCHED_CLASS_GHOST
-	rq->ghost.check_prev_preemption = ghost_produce_prev_msgs(rq, prev);
-
-	/* a negative 'switchto_count' indicates end of the chain */
-	rq->ghost.switchto_count = -rq->ghost.switchto_count;
-	WARN_ON_ONCE(rq->ghost.switchto_count > 0);
-	rq->ghost.pnt_bpf_once = true;
+	ghost_pnt_prologue(rq, prev);
 #endif
 
 	/*
@@ -9548,20 +9420,6 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 };
 
 #endif	/* CONFIG_CGROUP_SCHED */
-
-#ifndef CONFIG_SCHED_CLASS_GHOST
-SYSCALL_DEFINE5(ghost_run, s64, gtid, u32, agent_barrier, u32, task_barrier,
-                int, run_cpu, int, run_flags)
-{
-	return -ENOSYS;
-}
-
-SYSCALL_DEFINE6(ghost, u64, op, u64, arg1, u64, arg2, u64, arg3, u64, arg4,
-                u64, arg5)
-{
-	return -ENOSYS;
-}
-#endif
 
 void dump_cpu_task(int cpu)
 {

@@ -11,8 +11,8 @@
  * GNU General Public License for more details.
  */
 
-#ifndef _SCHED_GHOST_H_
-#define _SCHED_GHOST_H_
+#ifndef _UAPI_LINUX_GHOST_H_
+#define _UAPI_LINUX_GHOST_H_
 
 #include <linux/ioctl.h>
 
@@ -20,6 +20,7 @@
 #include <linux/limits.h>
 #else
 #include <limits.h>
+#include <sched.h>
 #include <stdint.h>
 #endif
 
@@ -30,7 +31,7 @@
  * process are the same version as each other. Each successive version changes
  * values in this header file, assumptions about operations in the kernel, etc.
  */
-#define GHOST_VERSION	49
+#define GHOST_VERSION	62
 
 /*
  * Define SCHED_GHOST via the ghost uapi unless it has already been defined
@@ -52,12 +53,6 @@
 enum ghost_type {
 	GHOST_AGENT,
 	GHOST_TASK,
-};
-
-enum {
-	GHOST_SCHED_TASK_PRIO,
-	GHOST_SCHED_AGENT_PRIO,
-	GHOST_SCHED_MAX_PRIO,
 };
 
 /*
@@ -82,6 +77,15 @@ struct ghost_msg_src {
 };
 #define GHOST_THIS_CPU	-1
 
+/* GHOST_TIMERFD_SETTIME */
+struct timerfd_ghost {
+	int cpu;
+	int flags;
+	uint64_t type;
+	uint64_t cookie;
+};
+#define TIMERFD_GHOST_ENABLED	(1 << 0)
+
 struct ghost_sw_info {
 	uint32_t id;		/* status_word region id */
 	uint32_t index;		/* index into the status_word array */
@@ -92,9 +96,80 @@ struct ghost_ioc_sw_get_info {
 	struct ghost_sw_info response;
 };
 
+struct ghost_ioc_create_queue {
+	int elems;
+	int node;
+	int flags;
+	ulong mapsize;
+};
+
+struct ghost_ioc_assoc_queue {
+	int fd;
+	struct ghost_msg_src src;
+	int barrier;
+	int flags;
+	int status;
+};
+
+struct ghost_ioc_set_default_queue {
+	int fd;
+};
+
+struct ghost_ioc_config_queue_wakeup {
+	int qfd;
+	struct ghost_agent_wakeup *w;
+	int ninfo;
+	int flags;
+};
+
+struct ghost_ioc_get_cpu_time {
+	int64_t gtid;
+	uint64_t runtime;
+};
+
+struct ghost_ioc_commit_txn {
+#ifdef __KERNEL__
+	ulong *mask_ptr;
+#else
+	cpu_set_t *mask_ptr;
+#endif
+	uint32_t mask_len;
+	int flags;
+};
+
+struct ghost_ioc_timerfd_settime {
+	int timerfd;
+	int flags;
+#ifdef __KERNEL__
+	struct __kernel_itimerspec *in_tmr;
+	struct __kernel_itimerspec *out_tmr;
+#else
+	struct itimerspec *in_tmr;
+	struct itimerspec *out_tmr;
+#endif
+	struct timerfd_ghost timerfd_ghost;
+};
+
+struct ghost_ioc_run {
+	int64_t gtid;
+	uint32_t agent_barrier;
+	uint32_t task_barrier;
+	int run_cpu;
+	int run_flags;
+};
+
 #define GHOST_IOC_NULL			_IO('g', 0)
-#define GHOST_IOC_SW_GET_INFO		_IOWR('g', 1, struct ghost_ioc_sw_get_info *)
-#define GHOST_IOC_SW_FREE		_IOW('g', 2, struct ghost_sw_info *)
+#define GHOST_IOC_SW_GET_INFO		_IOWR('g', 1, struct ghost_ioc_sw_get_info)
+#define GHOST_IOC_SW_FREE		_IOW('g', 2, struct ghost_sw_info)
+#define GHOST_IOC_CREATE_QUEUE		_IOWR('g', 3, struct ghost_ioc_create_queue)
+#define GHOST_IOC_ASSOC_QUEUE		_IOWR('g', 4, struct ghost_ioc_assoc_queue)
+#define GHOST_IOC_SET_DEFAULT_QUEUE	_IOW('g', 5, struct ghost_ioc_set_default_queue)
+#define GHOST_IOC_CONFIG_QUEUE_WAKEUP	_IOW('g', 6, struct ghost_ioc_config_queue_wakeup)
+#define GHOST_IOC_GET_CPU_TIME		_IOWR('g', 7, struct ghost_ioc_get_cpu_time)
+#define GHOST_IOC_COMMIT_TXN		_IOW('g', 8, struct ghost_ioc_commit_txn)
+#define GHOST_IOC_SYNC_GROUP_TXN	_IOW('g', 9, struct ghost_ioc_commit_txn)
+#define GHOST_IOC_TIMERFD_SETTIME	_IOWR('g', 10, struct ghost_ioc_timerfd_settime)
+#define GHOST_IOC_RUN			_IOW('g', 11, struct ghost_ioc_run)
 
 /*
  * Status word region APIs.
@@ -134,6 +209,36 @@ struct ghost_status_word {
 #define GHOST_SW_TASK_ONCPU	(1U << 16)   /* task is oncpu */
 #define GHOST_SW_TASK_RUNNABLE	(1U << 17)   /* task is runnable */
 #define GHOST_SW_TASK_IS_AGENT  (1U << 18)
+#define GHOST_SW_TASK_MSG_GATED (1U << 19)   /* all task msgs are gated until
+					      * status_word is freed by agent */
+
+#ifdef __KERNEL__
+static inline void ghost_sw_set_flag(struct ghost_status_word *sw,
+				     uint32_t flag)
+{
+	/* Pairs with an acquire load in StatusWord::sw_flags() in the agent */
+	smp_store_release(&sw->flags, sw->flags | flag);
+}
+
+static inline void ghost_sw_clear_flag(struct ghost_status_word *sw,
+				       uint32_t flag)
+{
+	/* Pairs with an acquire load in StatusWord::sw_flags() in the agent */
+	smp_store_release(&sw->flags, sw->flags & ~flag);
+}
+
+static inline void ghost_sw_set_time(struct ghost_status_word *sw,
+				     s64 time)
+{
+	/*
+	 * Do a relaxed store since userspace syncs with the release store to
+	 * `sw->flags` for setting the oncpu bit in `ghost_sw_set_flag`. We set
+	 * the time in this function before setting the oncpu bit, so we use
+	 * that release store as a barrier.
+	 */
+	WRITE_ONCE(sw->switch_time, time);
+}
+#endif	/* __KERNEL__ */
 
 /*
  * Queue APIs.
@@ -282,6 +387,7 @@ struct ghost_msg_payload_cpu_tick {
 
 struct ghost_msg_payload_timer {
 	int cpu;
+	uint64_t type;
 	uint64_t cookie;
 };
 
@@ -329,33 +435,10 @@ struct ghost_ring {
 #define GHOST_MAX_QUEUE_ELEMS	65536	/* arbitrary */
 
 /*
- * Define ghOSt syscall numbers here until they can be discovered via
- * <unistd.h>.
- */
-#ifndef __NR_ghost_run
-#define __NR_ghost_run	450
-#endif
-#ifndef __NR_ghost
-#define __NR_ghost	451
-#endif
-
-/*
  * 'ops' supported by gsys_ghost().
  */
 enum ghost_ops {
-	GHOST_NULL,
-	GHOST_CREATE_QUEUE,
-	GHOST_ASSOCIATE_QUEUE,
-	GHOST_CONFIG_QUEUE_WAKEUP,
-	GHOST_SET_OPTION,
-	GHOST_GET_CPU_TIME,
-	GHOST_COMMIT_TXN,
-	GHOST_SYNC_GROUP_TXN,
-	GHOST_TIMERFD_SETTIME,
 	GHOST_GTID_LOOKUP,
-	GHOST_GET_GTID_10,	/* TODO: deprecate */
-	GHOST_GET_GTID_11,	/* TODO: deprecate */
-	GHOST_SET_DEFAULT_QUEUE,
 };
 
 /*
@@ -508,29 +591,11 @@ struct ghost_cpu_data {
 
 #define GHOST_TXN_VERSION	0
 
-/* GHOST_TIMERFD_SETTIME */
-struct timerfd_ghost {
-	int cpu;
-	int flags;
-	uint64_t cookie;
-};
-#define TIMERFD_GHOST_ENABLED	(1 << 0)
-
 /* GHOST_GTID_LOOKUP */
 enum {
 	GHOST_GTID_LOOKUP_TGID,		/* return group_leader pid */
 };
 
-/*
- * ghost tids referring to normal tasks always have a positive value:
- * (0 | 22 bits of actual pid_t | 41 bit non-zero seqnum)
- *
- * The embedded 'pid' following linux terminology is actually referring
- * to the thread id (i.e. what would be returned by syscall(__NR_gettid)).
- */
-#define GHOST_TID_SEQNUM_BITS	41
-#define GHOST_TID_PID_BITS	22
-
 // NOLINTEND
 
-#endif	/* _SCHED_GHOST_H_ */
+#endif	/* _UAPI_LINUX_GHOST_H_ */

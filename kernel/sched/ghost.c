@@ -24,51 +24,38 @@
 #include <asm/apic.h>
 #endif
 
-#include <uapi/linux/ghost.h>
-
 #include <trace/events/sched.h>
 
-#include "ghost.h"
 #include "sched.h"
+#include "kernfs-internal.h"
 
-/* ghost tid */
-typedef int64_t gtid_t;
-
-/* Lock ordering is enclave -> cpu_rsvp */
-static DEFINE_SPINLOCK(cpu_rsvp);
-static struct cpumask cpus_in_enclave;	/* protected by cpu_rsvp lock */
+#define __INCLUDE_KERNEL_SCHED_GHOST
+#include "ghost_uapi.h"
+#include "ghost.h"
 
 /* The ghost_txn pointer equals NULL or &enclave->cpu_data[this_cpu].txn */
 static DEFINE_PER_CPU_READ_MOSTLY(struct ghost_txn *, ghost_txn);
-static DEFINE_PER_CPU_READ_MOSTLY(struct ghost_enclave *, enclave);
 
-static DEFINE_PER_CPU(int64_t, sync_group_cookie);
 /*
  * Use per-cpu memory instead of stack memory to avoid memsetting.  We only
  * send one message at a time per cpu.
  */
 static DEFINE_PER_CPU(struct bpf_ghost_msg, bpf_ghost_msg);
 
-/*
- * We do not want to make 'SG_COOKIE_CPU_BITS' larger than necessary so that
- * we can maximize the number of times a sequence counter can increment before
- * overflowing.
- */
-#if (CONFIG_NR_CPUS < 2048)
-#define SG_COOKIE_CPU_BITS	11
-#else
-#define SG_COOKIE_CPU_BITS	14
-#endif
-#define SG_COOKIE_CPU_SHIFT	(63 - SG_COOKIE_CPU_BITS)	/* MSB=0 */
-
-/* The load contribution that CFS sees for a running ghOSt task */
-unsigned long sysctl_ghost_cfs_load_added = 1024;
+struct ghost_sw_region {
+	struct list_head list;			/* ghost_enclave glue */
+	uint32_t alloc_scan_start;		/* allocator starts scan here */
+	struct ghost_sw_region_header *header;  /* pointer to vmalloc memory */
+	size_t mmap_sz;				/* size of mmapped region */
+	struct ghost_enclave *enclave;
+};
 
 static void _ghost_task_new(struct rq *rq, struct task_struct *p,
 			    bool runnable);
 static void ghost_task_yield(struct rq *rq, struct task_struct *p);
 static void ghost_task_blocked(struct rq *rq, struct task_struct *p);
-static void task_dead_ghost(struct task_struct *p);
+static void task_deliver_msg_task_new(struct rq *rq, struct task_struct *p,
+				      bool runnable);
 static void task_deliver_msg_affinity_changed(struct rq *rq,
 					      struct task_struct *p);
 static void task_deliver_msg_departed(struct rq *rq, struct task_struct *p);
@@ -85,13 +72,14 @@ static void ghost_commit_all_greedy_txns(void);
 static void ghost_commit_pending_txn(int where);
 static void release_from_ghost(struct rq *rq, struct task_struct *p);
 static void ghost_wake_agent_on(int cpu);
+static void ghost_wake_agent_of(struct task_struct *p);
+static void ghost_latched_task_preempted(struct rq *rq);
+static void ghost_task_preempted(struct rq *rq, struct task_struct *p);
 static void _ghost_task_preempted(struct rq *rq, struct task_struct *p,
 				  bool was_latched);
 
-struct rq *context_switch(struct rq *rq, struct task_struct *prev,
-			  struct task_struct *next, struct rq_flags *rf);
+static void ghost_task_new(struct rq *rq, struct task_struct *p);
 
-void schedule_callback(struct rq *rq);
 struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 			    struct task_struct *p, int new_cpu);
 
@@ -99,6 +87,9 @@ static void __enclave_remove_task(struct ghost_enclave *e,
 				  struct task_struct *p);
 static int __sw_region_free(struct ghost_sw_region *region);
 static const struct file_operations queue_fops;
+
+static void ghost_destroy_enclave(struct ghost_enclave *e);
+static void enclave_release(struct kref *k);
 
 /* True if X and Y have the same enclave, including having no enclave. */
 static bool check_same_enclave(int cpu_x, int cpu_y)
@@ -141,6 +132,109 @@ static inline bool enclave_is_reapable(struct ghost_enclave *e)
 	}
 	return false;
 }
+
+#ifdef CONFIG_BPF
+#include <linux/filter.h>
+
+static bool ghost_bpf_skip_tick(struct ghost_enclave *e, struct rq *rq)
+{
+	struct bpf_ghost_sched_kern ctx = {};
+	struct bpf_prog *prog;
+
+	lockdep_assert_held(&rq->lock);
+
+	prog = rcu_dereference(e->bpf_tick);
+	if (!prog)
+		return false;
+
+	/* prog returns 1 if we want a tick on this cpu. */
+	return BPF_PROG_RUN(prog, &ctx) != 1;
+}
+
+#define BPF_GHOST_PNT_DONT_IDLE		1
+
+static void ghost_bpf_pnt(struct ghost_enclave *e, struct rq *rq,
+			  struct rq_flags *rf)
+{
+	struct bpf_ghost_sched_kern ctx = {};
+	struct bpf_prog *prog;
+	int ret;
+
+	lockdep_assert_held(&rq->lock);
+
+	rcu_read_lock();
+	prog = rcu_dereference(e->bpf_pnt);
+	if (!prog) {
+		rcu_read_unlock();
+		return;
+	}
+
+	/*
+	 * BPF programs attached here may call ghost_run_gtid(), which requires
+	 * that we not hold any RQ locks.  We are called from
+	 * pick_next_task_ghost where it is safe to unlock the RQ.
+	 */
+	rq_unpin_lock(rq, rf);
+	raw_spin_unlock(&rq->lock);
+
+	ret = BPF_PROG_RUN(prog, &ctx);
+
+	raw_spin_lock(&rq->lock);
+	rq_repin_lock(rq, rf);
+
+	rcu_read_unlock();
+
+	if (ret == BPF_GHOST_PNT_DONT_IDLE) {
+		/*
+		 * The next time this rq selects the idle task, it will bail out
+		 * of do_idle() quickly.  Since we unlocked the RQ lock, it's
+		 * possible that this rq will pick something other than the idle
+		 * task, which is fine.
+		 */
+		rq->ghost.dont_idle_once = true;
+	}
+}
+
+/*
+ * Returns true (default) if the user wants us to send the message.
+ * Note that our caller holds an RQ lock, and we can't safely unlock it, so
+ * programs at the attach point can't call ghost_run_gtid().
+ */
+static bool ghost_bpf_msg_send(struct ghost_enclave *e,
+			       struct bpf_ghost_msg *msg)
+{
+	struct bpf_prog *prog;
+	bool send;
+
+	rcu_read_lock();
+	prog = rcu_dereference(e->bpf_msg_send);
+	if (!prog) {
+		rcu_read_unlock();
+		return true;
+	}
+	/* Program returns 0 if they want us to send the message. */
+	send = BPF_PROG_RUN(prog, msg) == 0;
+	rcu_read_unlock();
+	return send;
+}
+#else
+static inline bool ghost_bpf_skip_tick(struct ghost_enclave *e, struct rq *rq)
+{
+	return false;
+}
+
+static inline void ghost_bpf_pnt(struct ghost_enclave *e, struct rq *rq,
+				 struct rq_flags *rf)
+{
+	return;
+}
+
+static inline bool ghost_bpf_msg_send(struct ghost_enclave *e,
+				      struct bpf_ghost_msg *msg)
+{
+	return true;
+}
+#endif	/* CONFIG_BPF */
 
 /*
  * There are certain things we can't do in the scheduler while holding rq locks
@@ -275,12 +369,6 @@ static void submit_enclave_work(struct ghost_enclave *e, struct rq *rq,
 	queue_balance_callback(rq, &rq->ghost.ew_head, __do_enclave_work);
 }
 
-void init_ghost_rq(struct ghost_rq *ghost_rq)
-{
-	INIT_LIST_HEAD(&ghost_rq->tasks);
-	INIT_LIST_HEAD(&ghost_rq->enclave_work);
-}
-
 static inline gtid_t gtid(struct task_struct *p)
 {
 	return p->gtid;
@@ -291,17 +379,6 @@ static inline bool on_ghost_rq(struct rq *rq, struct task_struct *p)
 	lockdep_assert_held(&rq->lock);
 	VM_BUG_ON(rq != task_rq(p));
 	return !list_empty(&p->ghost.run_list);
-}
-
-bool is_agent(struct rq *rq, struct task_struct *p)
-{
-	if (rq->ghost.agent == p) {
-		VM_BUG_ON(!p->ghost.agent);
-		return true;
-	}
-
-	VM_BUG_ON(p->ghost.agent);
-	return false;
 }
 
 static inline bool ghost_can_schedule(struct rq *rq, gtid_t gtid)
@@ -477,7 +554,7 @@ static void __update_curr_ghost(struct rq *rq, bool update_sw)
 	/*
 	 * Bail if this due to a "spurious" dequeue.
 	 *
-	 * For e.g. dequeue_task_ghost() is called when scheduling properties
+	 * For e.g. _dequeue_task_ghost() is called when scheduling properties
 	 * of a runnable ghost task change (e.g. nice or cpu affinity), but
 	 * if that task is not oncpu then nothing needs to be done here.
 	 */
@@ -499,12 +576,12 @@ static void __update_curr_ghost(struct rq *rq, bool update_sw)
 		WRITE_ONCE(sw->runtime, curr->se.sum_exec_runtime);
 }
 
-static void update_curr_ghost(struct rq *rq)
+static void _update_curr_ghost(struct rq *rq)
 {
 	__update_curr_ghost(rq, true);
 }
 
-static void prio_changed_ghost(struct rq *rq, struct task_struct *p, int old)
+static void _prio_changed_ghost(struct rq *rq, struct task_struct *p, int old)
 {
 	/*
 	 * XXX produce MSG_TASK_PRIO_CHANGE into p->ghost.dst_q.
@@ -518,7 +595,7 @@ static void prio_changed_ghost(struct rq *rq, struct task_struct *p, int old)
 	 */
 }
 
-static void switched_to_ghost(struct rq *rq, struct task_struct *p)
+static void _switched_to_ghost(struct rq *rq, struct task_struct *p)
 {
 	struct ghost_status_word *status_word = p->ghost.status_word;
 
@@ -551,7 +628,7 @@ static void switched_to_ghost(struct rq *rq, struct task_struct *p)
 	}
 }
 
-static void switched_from_ghost(struct rq *rq, struct task_struct *p)
+static void _switched_from_ghost(struct rq *rq, struct task_struct *p)
 {
 	/*
 	 * A running task can be switched into ghost while it is executing
@@ -592,7 +669,7 @@ static void switched_from_ghost(struct rq *rq, struct task_struct *p)
 	}
 }
 
-static void dequeue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
+static void _dequeue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
 {
 	const bool spurious = flags & DEQUEUE_SAVE;
 	const bool sleeping = flags & DEQUEUE_SLEEP;
@@ -600,16 +677,16 @@ static void dequeue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
 
 	/*
 	 * A task is accumulating cputime only when it is oncpu. Thus it is
-	 * useless to call update_curr_ghost for a task that is 'on_rq' but
+	 * useless to call _update_curr_ghost for a task that is 'on_rq' but
 	 * is not running (in this case we'll just update the cputime of
 	 * whatever task happens to be oncpu).
 	 *
-	 * Ordinarily we wouldn't care but we routinely dequeue_task_ghost()
+	 * Ordinarily we wouldn't care but we routinely _dequeue_task_ghost()
 	 * when migrating a task via ghost_move_task() during txn commit so
-	 * we call update_curr_ghost() only if 'p' is actually running.
+	 * we call _update_curr_ghost() only if 'p' is actually running.
 	 */
 	if (task_current(rq, p))
-		update_curr_ghost(rq);
+		_update_curr_ghost(rq);
 
 	BUG_ON(rq->ghost.ghost_nr_running <= 0);
 	rq->ghost.ghost_nr_running--;
@@ -652,13 +729,13 @@ static void dequeue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
 	}
 }
 
-static void put_prev_task_ghost(struct rq *rq, struct task_struct *p)
+static void _put_prev_task_ghost(struct rq *rq, struct task_struct *p)
 {
-	update_curr_ghost(rq);
+	_update_curr_ghost(rq);
 }
 
 static void
-enqueue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
+_enqueue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
 {
 	add_nr_running(rq, 1);
 	rq->ghost.ghost_nr_running++;
@@ -672,7 +749,7 @@ enqueue_task_ghost(struct rq *rq, struct task_struct *p, int flags)
 	}
 }
 
-static void set_next_task_ghost(struct rq *rq, struct task_struct *p,
+static void _set_next_task_ghost(struct rq *rq, struct task_struct *p,
 				bool first)
 {
 	WARN_ON_ONCE(first);
@@ -752,38 +829,23 @@ static bool check_runnable_timeout(struct ghost_enclave *e, struct rq *rq)
 	return ok;
 }
 
-/*
- * Called from the timer tick handler after dropping rq->lock.  Called
- * regardless of whether a ghost task is current or not.
- */
-void ghost_tick(struct rq *rq)
+static void tick_handler(struct ghost_enclave *e, struct rq *rq)
 {
-	struct ghost_enclave *e;
-
-	rcu_read_lock();
-	e = rcu_dereference(*this_cpu_ptr(&enclave));
-	if (e) {
-		if (READ_ONCE(e->commit_at_tick))
-			ghost_commit_all_greedy_txns();
-		if (!check_runnable_timeout(e, rq)) {
-			kref_get(&e->kref);
-			if (!schedule_work(&e->enclave_destroyer)) {
-				/*
-				 * Safe since it is not the last reference, due
-				 * to RCU protecting per_cpu(enclave).
-				 */
-				kref_put(&e->kref, enclave_release);
-			}
+	if (READ_ONCE(e->commit_at_tick))
+		ghost_commit_all_greedy_txns();
+	if (!check_runnable_timeout(e, rq)) {
+		kref_get(&e->kref);
+		if (!schedule_work(&e->enclave_destroyer)) {
+			/*
+			 * Safe since it is not the last reference, due
+			 * to RCU protecting per_cpu(enclave).
+			 */
+			kref_put(&e->kref, enclave_release);
 		}
 	}
-	rcu_read_unlock();
 }
 
-/*
- * Called from the timer tick handler while holding the rq->lock.  Called only
- * if a ghost task is current.
- */
-static void task_tick_ghost(struct rq *rq, struct task_struct *p, int queued)
+static void _task_tick_ghost(struct rq *rq, struct task_struct *p, int queued)
 {
 	struct task_struct *agent = rq->ghost.agent;
 
@@ -827,8 +889,8 @@ static void task_tick_ghost(struct rq *rq, struct task_struct *p, int queued)
 		ghost_wake_agent_on(agent_target_cpu(rq));
 }
 
-static int balance_ghost(struct rq *rq, struct task_struct *prev,
-			 struct rq_flags *rf)
+static int _balance_ghost(struct rq *rq, struct task_struct *prev,
+			  struct rq_flags *rf)
 {
 
 	struct task_struct *agent = rq->ghost.agent;
@@ -867,7 +929,7 @@ static int balance_ghost(struct rq *rq, struct task_struct *prev,
 	return rq->ghost.latched_task || rq_adj_nr_running(rq);
 }
 
-static int select_task_rq_ghost(struct task_struct *p, int cpu, int wake_flags)
+static int _select_task_rq_ghost(struct task_struct *p, int cpu, int wake_flags)
 {
 	int waker_cpu = smp_processor_id();
 
@@ -931,7 +993,21 @@ static int validate_next_task(struct rq *rq, struct task_struct *next,
 {
 	lockdep_assert_held(&rq->lock);
 
-	if (!task_has_ghost_policy(next) || next->ghost.agent) {
+	if (next->ghost.agent) {
+		set_txn_state(state, GHOST_TXN_INVALID_TARGET);
+		return -EINVAL;
+	}
+
+	/*
+	 * Task departed, but the agent hasn't yet processed the
+	 * TASK_DEPARTED message.
+	 */
+	if (next->inhibit_task_msgs) {
+		set_txn_state(state, GHOST_TXN_TARGET_STALE);
+		return -EINVAL;
+	}
+
+	if (!task_has_ghost_policy(next)) {
 		set_txn_state(state, GHOST_TXN_INVALID_TARGET);
 		return -EINVAL;
 	}
@@ -1050,7 +1126,7 @@ static inline void ghost_prepare_switch(struct rq *rq, struct task_struct *prev,
  * msg was already produced for 'prev' (for e.g. agents don't expect to see a
  * TASK_PREEMPTED immediately after a TASK_BLOCKED).
  */
-bool ghost_produce_prev_msgs(struct rq *rq, struct task_struct *prev)
+static bool ghost_produce_prev_msgs(struct rq *rq, struct task_struct *prev)
 {
 	if (!task_has_ghost_policy(prev))
 		return false;
@@ -1098,7 +1174,7 @@ bool ghost_produce_prev_msgs(struct rq *rq, struct task_struct *prev)
 	return true;
 }
 
-void ghost_latched_task_preempted(struct rq *rq)
+static void ghost_latched_task_preempted(struct rq *rq)
 {
 	struct task_struct *latched = rq->ghost.latched_task;
 
@@ -1221,7 +1297,7 @@ done:
 	return next;
 }
 
-static struct task_struct *pick_next_task_ghost(struct rq *rq)
+static struct task_struct *_pick_next_task_ghost(struct rq *rq)
 {
 	struct task_struct *agent = rq->ghost.agent;
 	struct task_struct *prev = rq->curr;
@@ -1356,8 +1432,8 @@ done:
 	return next;
 }
 
-static void check_preempt_curr_ghost(struct rq *rq, struct task_struct *p,
-				     int wake_flags)
+static void _check_preempt_curr_ghost(struct rq *rq, struct task_struct *p,
+				      int wake_flags)
 {
 	if (is_agent(rq, p)) {
 		/*
@@ -1387,7 +1463,7 @@ static void check_preempt_curr_ghost(struct rq *rq, struct task_struct *p,
 	}
 }
 
-static void yield_task_ghost(struct rq *rq)
+static void _yield_task_ghost(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 
@@ -1425,8 +1501,8 @@ static void yield_task_ghost(struct rq *rq)
 	curr->ghost.yield_task = true;
 }
 
-static void set_cpus_allowed_ghost(struct task_struct *p,
-				   const struct cpumask *newmask, u32 flags)
+static void _set_cpus_allowed_ghost(struct task_struct *p,
+				    const struct cpumask *newmask, u32 flags)
 {
 	struct rq_flags rf;
 	struct rq *rq = task_rq(p);
@@ -1463,7 +1539,7 @@ static void set_cpus_allowed_ghost(struct task_struct *p,
 	set_cpus_allowed_common(p, newmask, flags);
 }
 
-static void task_woken_ghost(struct rq *rq, struct task_struct *p)
+static void _task_woken_ghost(struct rq *rq, struct task_struct *p)
 {
 	struct ghost_status_word *sw = p->ghost.status_word;
 
@@ -1488,47 +1564,6 @@ done:
 	ghost_wake_agent_of(p);
 }
 
-DEFINE_SCHED_CLASS(ghost) = {
-	.update_curr		= update_curr_ghost,
-	.prio_changed		= prio_changed_ghost,
-	.switched_to		= switched_to_ghost,
-	.switched_from		= switched_from_ghost,
-	.task_dead		= task_dead_ghost,
-	.dequeue_task		= dequeue_task_ghost,
-	.put_prev_task		= put_prev_task_ghost,
-	.enqueue_task		= enqueue_task_ghost,
-	.set_next_task		= set_next_task_ghost,
-	.task_tick		= task_tick_ghost,
-	.pick_next_task		= pick_next_task_ghost,
-	.check_preempt_curr	= check_preempt_curr_ghost,
-	.yield_task		= yield_task_ghost,
-#ifdef CONFIG_SMP
-	.balance		= balance_ghost,
-	.select_task_rq		= select_task_rq_ghost,
-	.task_woken		= task_woken_ghost,
-	.set_cpus_allowed	= set_cpus_allowed_ghost,
-#endif
-};
-
-static int balance_agent(struct rq *rq, struct task_struct *prev,
-			 struct rq_flags *rf)
-{
-	return 0;
-}
-
-/*
- * An interstitial sched class that operates below the stop_sched_class. It
- * enables returning to an agent at the highest priority when the agent is about
- * to lose its CPU to another sched class. This allows the agent to transition
- * to another CPU before giving up its CPU.
- */
-DEFINE_SCHED_CLASS(ghost_agent) = {
-	.pick_next_task		= pick_next_ghost_agent,
-#ifdef CONFIG_SMP
-	.balance		= balance_agent,
-#endif
-};
-
 /*
  * Migrate 'next' (if necessary) in preparation to run it on 'cpu'.
  *
@@ -1545,7 +1580,7 @@ static struct rq *ghost_move_task(struct rq *rq, struct task_struct *next,
 
 	/*
 	 * Cleared in invalidate_cached_tasks() via move_queued_task()
-	 * and dequeue_task_ghost(). We cannot clear it here because
+	 * and _dequeue_task_ghost(). We cannot clear it here because
 	 * move_queued_task() will release rq->lock (the rq returned
 	 * by move_queued_task() is different than the one passed in).
 	 */
@@ -1568,7 +1603,7 @@ static struct rq *ghost_move_task(struct rq *rq, struct task_struct *next,
 	return rq;
 }
 
-int _ghost_mmap_common(struct vm_area_struct *vma, ulong mapsize)
+static int _ghost_mmap_common(struct vm_area_struct *vma, ulong mapsize)
 {
 	static const struct vm_operations_struct ghost_vm_ops = {};
 
@@ -1620,8 +1655,8 @@ int _ghost_mmap_common(struct vm_area_struct *vma, ulong mapsize)
  *
  * 'addr' must have been obtained from vmalloc_user().
  */
-int ghost_region_mmap(struct file *file, struct vm_area_struct *vma,
-		      void *addr, ulong mapsize)
+static int ghost_region_mmap(struct file *file, struct vm_area_struct *vma,
+			     void *addr, ulong mapsize)
 {
 	int error;
 
@@ -1632,8 +1667,8 @@ int ghost_region_mmap(struct file *file, struct vm_area_struct *vma,
 	return error;
 }
 
-int ghost_cpu_data_mmap(struct file *file, struct vm_area_struct *vma,
-			struct ghost_cpu_data **cpu_data, ulong mapsize)
+static int ghost_cpu_data_mmap(struct file *file, struct vm_area_struct *vma,
+			       struct ghost_cpu_data **cpu_data, ulong mapsize)
 {
 	int error;
 	unsigned long uaddr;
@@ -1707,7 +1742,7 @@ static void __queue_free_work(struct work_struct *work)
 	kfree(q);
 }
 
-void _queue_free_rcu_callback(struct rcu_head *rhp)
+static void _queue_free_rcu_callback(struct rcu_head *rhp)
 {
 	struct ghost_queue *q = container_of(rhp, struct ghost_queue, rcu);
 
@@ -1743,15 +1778,14 @@ static inline void queue_incref(struct ghost_queue *q)
 	kref_get(&q->kref);
 }
 
-/* Hold e->lock and the cpu_rsvp lock */
-static void __enclave_add_cpu(struct ghost_enclave *e, int cpu)
+/*
+ * Callback from ghost_add_cpus().  Caller must hold e->lock.
+ */
+static void ___enclave_add_cpu(struct ghost_enclave *e, int cpu)
 {
 	struct ghost_txn *txn;
 
 	VM_BUG_ON(!spin_is_locked(&e->lock));
-	VM_BUG_ON(!spin_is_locked(&cpu_rsvp));
-
-	VM_BUG_ON(cpumask_test_cpu(cpu, &cpus_in_enclave));
 	VM_BUG_ON(cpumask_test_cpu(cpu, &e->cpus));
 
 	txn = &e->cpu_data[cpu]->txn;
@@ -1766,41 +1800,19 @@ static void __enclave_add_cpu(struct ghost_enclave *e, int cpu)
 	txn->u.sync_group_owner = -1;
 	txn->state = GHOST_TXN_COMPLETE;
 
-	cpumask_set_cpu(cpu, &cpus_in_enclave);
 	cpumask_set_cpu(cpu, &e->cpus);
-	rcu_assign_pointer(per_cpu(enclave, cpu), e);
 	rcu_assign_pointer(per_cpu(ghost_txn, cpu), txn);
 }
 
-/* Hold e->lock.  Caller must synchronize_rcu(). */
-static void __enclave_unpublish_cpu(struct ghost_enclave *e, int cpu)
-{
-	VM_BUG_ON(!spin_is_locked(&e->lock));
-
-	rcu_assign_pointer(per_cpu(enclave, cpu), NULL);
-	rcu_assign_pointer(per_cpu(ghost_txn, cpu), NULL);
-}
-
-/* Hold e->lock and the cpu_rsvp lock. */
-static void __enclave_return_cpu(struct ghost_enclave *e, int cpu)
-{
-	VM_BUG_ON(!spin_is_locked(&e->lock));
-	VM_BUG_ON(!spin_is_locked(&cpu_rsvp));
-
-	VM_BUG_ON(!cpumask_test_cpu(cpu, &cpus_in_enclave));
-	VM_BUG_ON(!cpumask_test_cpu(cpu, &e->cpus));
-
-	cpumask_clear_cpu(cpu, &cpus_in_enclave);
-	cpumask_clear_cpu(cpu, &e->cpus);
-}
-
-/* Hold e->lock and the cpu_rsvp lock.  Caller must synchronize_rcu(). */
+/* Caller must hold e->lock and synchronize_rcu() on return */
 static void __enclave_remove_cpu(struct ghost_enclave *e, int cpu)
 {
-	__enclave_unpublish_cpu(e, cpu);
-	/* cpu no longer belongs to any enclave */
-	__enclave_return_cpu(e, cpu);
-	/* cpu can no be assigned to another enclave */
+	VM_BUG_ON(!spin_is_locked(&e->lock));
+	VM_BUG_ON(!cpumask_test_cpu(cpu, &e->cpus));
+
+	rcu_assign_pointer(per_cpu(ghost_txn, cpu), NULL);
+	cpumask_clear_cpu(cpu, &e->cpus);
+	ghost_remove_cpu(e, cpu);
 }
 
 /*
@@ -1818,6 +1830,12 @@ static void enclave_actual_release(struct work_struct *w)
 	list_for_each_entry_safe(swr, temp, &e->sw_region_list, list)
 		__sw_region_free(swr);
 
+	/*
+	 * Any inhibited tasks should have been "released" as a side-effect
+	 * of freeing the status_word regions above.
+	 */
+	WARN_ON_ONCE(!list_empty(&e->inhibited_task_list));
+
 	for_each_possible_cpu(cpu)
 		vfree(e->cpu_data[cpu]);
 
@@ -1825,7 +1843,7 @@ static void enclave_actual_release(struct work_struct *w)
 	kfree(e);
 }
 
-void enclave_release(struct kref *k)
+static void enclave_release(struct kref *k)
 {
 	struct ghost_enclave *e = container_of(k, struct ghost_enclave, kref);
 
@@ -1909,60 +1927,13 @@ static void enclave_destroyer(struct work_struct *work)
 	kref_put(&e->kref, enclave_release);
 }
 
-struct ghost_enclave *ghost_create_enclave(void)
-{
-	struct ghost_enclave *e = kzalloc(sizeof(*e), GFP_KERNEL);
-	bool vmalloc_failed = false;
-	int cpu;
-
-	BUILD_BUG_ON(sizeof(struct ghost_cpu_data) != PAGE_SIZE);
-
-	if (!e)
-		return NULL;
-	spin_lock_init(&e->lock);
-	kref_init(&e->kref);
-	INIT_LIST_HEAD(&e->sw_region_list);
-	INIT_LIST_HEAD(&e->task_list);
-	INIT_LIST_HEAD(&e->ew.link);
-	INIT_WORK(&e->task_reaper, enclave_reap_tasks);
-	INIT_WORK(&e->enclave_actual_release, enclave_actual_release);
-	INIT_WORK(&e->enclave_destroyer, enclave_destroyer);
-
-	e->cpu_data = kcalloc(num_possible_cpus(),
-			      sizeof(struct ghost_cpu_data *), GFP_KERNEL);
-	if (!e->cpu_data) {
-		kfree(e);
-		return NULL;
-	}
-
-	for_each_possible_cpu(cpu) {
-		e->cpu_data[cpu] = vmalloc_user_node_flags(PAGE_SIZE,
-							   cpu_to_node(cpu),
-							   GFP_KERNEL);
-		if (e->cpu_data[cpu] == NULL) {
-			vmalloc_failed = true;
-			break;
-		}
-	}
-
-	if (vmalloc_failed) {
-		for_each_possible_cpu(cpu)
-			vfree(e->cpu_data[cpu]);
-		kfree(e->cpu_data);
-		kfree(e);
-		return NULL;
-	}
-
-	return e;
-}
-
 /*
  * Here we can trigger any destruction we want, such as killing agents, kicking
  * tasks to CFS, etc.  Undo things that were done at runtime.
  *
  * The enclave itself isn't freed until enclave_release().
  */
-void ghost_destroy_enclave(struct ghost_enclave *e)
+static void ghost_destroy_enclave(struct ghost_enclave *e)
 {
 	ulong flags;
 	int cpu;
@@ -1995,17 +1966,24 @@ void ghost_destroy_enclave(struct ghost_enclave *e)
 	 * give the cpu back to the system right away, we don't have to worry
 	 * about anyone reusing the rq's agent fields.
 	 *
-	 * However, we *do* want to "unpublish" the assignment of the cpu to the
-	 * enclave.  This way, once we synchronize_rcu, no one can be using this
-	 * cpu.  We could defer that until release_from_ghost(), but that is not
-	 * a convenient place to call synchronize_rcu() (holding RQ lock).
+	 * Note that pcpu->enclave is still set until the agent task exits a
+	 * given cpu.  We must follow the pattern of:
+	 *   1) pcpu->enclave = NULL
+	 *   2) synchronize_rcu()
+	 *   3) decref the enclave
+	 * because pcpu->enclave is protected and kreffable during
+	 * rcu_read_lock().
 	 *
-	 * In essence, __enclave_remove_cpu() is split: we unpublish the cpu
-	 * here, then return it to the system when the agent leaves ghost.  Note
-	 * the agent could be leaving ghost of its own volition concurrently;
-	 * the enclave lock ensures that if we see an agent, it will remove the
-	 * cpu.  And if not, we fully remove it here.  We make that decision
-	 * before we unlock in the loop below.
+	 * All three steps are handled in release_from_ghost().  We tell the
+	 * agent to do this via agent->ghost.__agent_decref_enclave.  This needs
+	 * to be per-agent, and not per-rq, since the moment we return the cpu
+	 * to the system, another enclave and agent can reuse the fields in
+	 * rq->ghost.
+	 *
+	 * Note the agent could be leaving ghost of its own volition
+	 * concurrently; the enclave lock ensures that if we see an agent, it
+	 * will remove the cpu when it exits.  And if not, we fully remove it
+	 * here.  We make that decision before we unlock in the loop below.
 	 *
 	 * Why do we unlock?  Because send_sig grabs the pi_lock, and the lock
 	 * ordering is pi -> rq -> e.  This is safe, since the lock is no longer
@@ -2020,13 +1998,12 @@ void ghost_destroy_enclave(struct ghost_enclave *e)
 		struct task_struct *agent;
 
 		if (!rq->ghost.agent) {
-			spin_lock(&cpu_rsvp);
 			__enclave_remove_cpu(e, cpu);
-			spin_unlock(&cpu_rsvp);
 			continue;
 		}
-		__enclave_unpublish_cpu(e, cpu);
-		rq->ghost.agent_remove_enclave_cpu = true;
+		agent = rq->ghost.agent;
+		kref_get(&e->kref);
+		agent->ghost.__agent_decref_enclave = e;
 		/*
 		 * We can't force_sig().  The task might be exiting and losing
 		 * its sighand_struct.  send_sig_info() checks for that.  We
@@ -2037,7 +2014,6 @@ void ghost_destroy_enclave(struct ghost_enclave *e)
 		 * might be dying on its own, we need to get a refcount while we
 		 * poke it.
 		 */
-		agent = rq->ghost.agent;
 		get_task_struct(agent);
 		spin_unlock_irqrestore(&e->lock, flags);
 		send_sig_info(SIGKILL, SEND_SIG_PRIV, agent);
@@ -2046,7 +2022,7 @@ void ghost_destroy_enclave(struct ghost_enclave *e)
 	}
 	spin_unlock_irqrestore(&e->lock, flags);
 
-	synchronize_rcu();	/* Required after unpublishing a cpu */
+	synchronize_rcu();	/* Required after removing a cpu */
 
 	/*
 	 * It is safe to reap all tasks in the enclave only _after_
@@ -2073,7 +2049,7 @@ void ghost_destroy_enclave(struct ghost_enclave *e)
 	 * still be open FDs, each of which holds a reference.  When the last FD
 	 * is closed, we'll release and free.
 	 */
-	ghostfs_remove_enclave(e);
+	kernfs_remove(e->enclave_dir);
 
 	kref_put(&e->kref, enclave_release);
 }
@@ -2083,7 +2059,8 @@ void ghost_destroy_enclave(struct ghost_enclave *e)
  * Returns an error code on failure and does not change the enclave.  Will fail
  * if a cpu is in another enclave.
  */
-int ghost_enclave_set_cpus(struct ghost_enclave *e, const struct cpumask *cpus)
+static int ghost_enclave_set_cpus(struct ghost_enclave *e,
+				  const struct cpumask *cpus)
 {
 	unsigned long flags;
 	unsigned int cpu;
@@ -2118,74 +2095,29 @@ int ghost_enclave_set_cpus(struct ghost_enclave *e, const struct cpumask *cpus)
 		}
 	}
 
-	spin_lock(&cpu_rsvp);
-
-	if (cpumask_intersects(add, &cpus_in_enclave)) {
-		ret = -EBUSY;
-		goto out_rsvp;
-	}
 	for_each_cpu(cpu, add) {
 		if (!cpu_online(cpu)) {
 			ret = -ENODEV;
-			goto out_rsvp;
+			goto out_e;
 		}
 	}
 
-	for_each_cpu(cpu, add)
-		__enclave_add_cpu(e, cpu);
+	ret = ghost_add_cpus(e, add);
+	if (ret)
+		goto out_e;
+
 	for_each_cpu(cpu, del)
 		__enclave_remove_cpu(e, cpu);
 
-out_rsvp:
-	spin_unlock(&cpu_rsvp);
 out_e:
 	spin_unlock_irqrestore(&e->lock, flags);
 
-	synchronize_rcu();	/* Required after unpublishing a cpu */
+	synchronize_rcu();	/* Required after removing a cpu */
 
 	free_cpumask_var(add);
 	free_cpumask_var(del);
 
 	return ret;
-}
-
-void __init init_sched_ghost_class(void)
-{
-	int64_t cpu;
-
-	for_each_possible_cpu(cpu)
-		per_cpu(sync_group_cookie, cpu) = cpu << SG_COOKIE_CPU_SHIFT;
-}
-
-/*
- * Helper to get an fd and translate it to an enclave.  Ghostfs will maintain a
- * kref on the enclave.  That kref is increffed when the file was opened, and
- * that kref is maintained by this call (a combination of fdget and
- * kernfs_get_active).  Once you call ghost_fdput_enclave(), the enclave kref
- * can be released.
- *
- * Returns NULL if there is not a ghost_enclave for this FD, which could be due
- * to concurrent enclave destruction.
- *
- * Caller must call ghost_fdput_enclave with e and &fd_to_put, even on error.
- */
-struct ghost_enclave *ghost_fdget_enclave(int fd, struct fd *fd_to_put)
-{
-	*fd_to_put = fdget(fd);
-	if (!fd_to_put->file)
-		return NULL;
-	return ghostfs_ctl_to_enclave(fd_to_put->file);
-}
-
-/*
- * Pairs with calls to ghost_fdget_enclave().  You can't call this while holding
- * the rq lock.
- */
-void ghost_fdput_enclave(struct ghost_enclave *e, struct fd *fd_to_put)
-{
-	if (e)
-		ghostfs_put_enclave_ctl(fd_to_put->file);
-	fdput(*fd_to_put);
 }
 
 static struct ghost_queue *fd_to_queue(struct fd f)
@@ -2353,7 +2285,7 @@ done:
 	return found;
 }
 
-void ghost_initialize_status_word(struct task_struct *p)
+static void ghost_initialize_status_word(struct task_struct *p)
 {
 	struct ghost_status_word *sw = p->ghost.status_word;
 
@@ -2372,25 +2304,6 @@ void ghost_initialize_status_word(struct task_struct *p)
 	 * status_word when discovering tasks from the status_word region.
 	 */
 	ghost_sw_set_flag(sw, GHOST_SW_F_INUSE);
-}
-
-int64_t ghost_alloc_gtid(struct task_struct *p)
-{
-	gtid_t gtid;
-	uint64_t seqnum;
-
-	static atomic64_t gtid_seqnum = ATOMIC64_INIT(0);
-
-	BUILD_BUG_ON(PID_MAX_LIMIT > (1UL << GHOST_TID_PID_BITS));
-
-	do {
-		seqnum = atomic64_add_return(1, &gtid_seqnum) &
-				((1UL << GHOST_TID_SEQNUM_BITS) - 1);
-	} while (!seqnum);
-
-	gtid = ((gtid_t)p->pid << GHOST_TID_SEQNUM_BITS) | seqnum;
-	WARN_ON_ONCE(gtid <= 0);
-	return gtid;
 }
 
 /*
@@ -2428,6 +2341,31 @@ static int __ghost_prep_task(struct ghost_enclave *e, struct task_struct *p,
 		error = -EXDEV;
 		goto done;
 	}
+
+	/*
+	 * If msg inhibition is in effect then make sure that the task does
+	 * not jump ABI versions (i.e. it must setsched into an enclave that
+	 * has the same abi version as the one it belonged to earlier).
+	 *
+	 * Note that this is trivially true if the task switches back into
+	 * the same enclave.
+	 *
+	 * Why? different enclaves may be at different ABI versions so when
+	 * the status_word is freed from the original enclave we may not have
+	 * access to the function that produces TASK_NEW in the new ABI.
+	 */
+	if (p->inhibit_task_msgs) {
+		/*
+		 * 'inhibit_task_msgs' is used as a boolean but it actually
+		 * holds the abi of the enclave the task departed from.
+		 */
+		uint old_abi = p->inhibit_task_msgs;
+		if (old_abi != enclave_abi(e)) {
+			error = -EINVAL;
+			goto done;
+		}
+	}
+
 	if (q) {
 		/*
 		 * It's possible for a client task to have no queue: it may have
@@ -2478,6 +2416,112 @@ done:
 }
 
 /*
+ * Caller must call ghost_uninhibit_task_msgs(p) on the task returned from
+ * this function. Ideally we would have had a single function that removes
+ * the task from the 'inhibited_task_list' and enables msgs for this task,
+ * but we must split them up due to locking requirements (removing the
+ * task requires enclave to be locked whereas ungating msgs requires
+ * that no locks are held).
+ */
+static struct task_struct *
+__enclave_remove_inhibited_task(struct ghost_enclave *e, gtid_t gtid)
+{
+	struct task_struct *p;
+
+	if (kref_read(&e->kref)) {
+		lockdep_assert_held(&e->lock);
+	} else {
+		/*
+		 * No more references to the enclave (called from
+		 * enclave_actual_release()).
+		 */
+	}
+
+	/*
+	 * N.B. cannot use find_task_by_gtid() to do the {gtid->task_struct}
+	 * lookup here since that function expects to be called in an agent
+	 * context.
+	 */
+	list_for_each_entry(p, &e->inhibited_task_list, inhibited_task_list) {
+		if (p->gtid == gtid) {
+			list_del_init(&p->inhibited_task_list);
+			return p;
+		}
+	}
+	return NULL;
+}
+
+static void ghost_uninhibit_task_msgs(struct task_struct *p)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	if (WARN_ON_ONCE(!p->inhibit_task_msgs))
+		goto done;
+
+	rq = task_rq_lock(p, &rf);
+	if (p->state != TASK_DEAD) {
+		/*
+		 * 'inhibit_task_msgs' is used as a boolean but it actually
+		 * holds the abi of the enclave the task departed from.
+		 */
+		const uint old_abi = p->inhibit_task_msgs;
+
+		p->inhibit_task_msgs = 0;	/* open the gate */
+
+		if (ghost_class(p->sched_class)) {
+			WARN_ON_ONCE(old_abi != enclave_abi(p->ghost.enclave));
+			if (p->ghost.new_task) {
+				/*
+				 * Task is oncpu and will produce TASK_NEW on
+				 * the next scheduling edge.
+				 */
+				WARN_ON_ONCE(!task_running(rq, p));
+			} else {
+				const bool runnable = task_on_rq_queued(p);
+				task_deliver_msg_task_new(rq, p, runnable);
+				ghost_wake_agent_of(p);
+			}
+		} else {
+			/*
+			 * Nothing: we opened the gate above so if/when the
+			 * task switches into ghost we'll produce a TASK_NEW
+			 * msg immediately.
+			 */
+		}
+	} else {
+		/*
+		 * There are three possibilities here:
+		 *
+		 * 1. task has finished scheduling for the last time and the
+		 * task_dead() callback is happening concurrently or has
+		 * finished executing.
+		 *
+		 * 2. task is in the middle of its last __schedule() and we
+		 * sneaked in while rq->lock was dropped in one of the PNT
+		 * sched_class callbacks.
+		 *
+		 * 3. task is about to __schedule() for the very last time
+		 * (running concurrently in do_task_dead() or spinning on
+		 * rq->lock in __schedule()).
+		 *
+		 * It would be problematic if we produced TASK_NEW in the
+		 * first scenario since there is no guarantee that we'll
+		 * also produce the corresponding TASK_DEAD and because we
+		 * cannot distinguish (1) from (2) or (3) we won't produce
+		 * the TASK_NEW msg or clear p->inhibit_task_msgs.
+		 *
+		 * Note that release_from_ghost() will free the status_word
+		 * in all of these cases.
+		 */
+	}
+	task_rq_unlock(rq, p, &rf);
+
+done:
+	put_task_struct(p);
+}
+
+/*
  * Only called from enclave_release.  Any users of this SWR had an enclave kref,
  * so if we're here, they must all have stopped using their SW.  This also
  * includes anyone mmapping the ghostfs file.
@@ -2488,11 +2532,54 @@ done:
  */
 static int __sw_region_free(struct ghost_sw_region *swr)
 {
-	struct ghost_sw_region_header *h = swr->header;
+	struct ghost_sw_region_header *header = swr->header;
+	struct ghost_status_word *sw;
+	struct task_struct *p;
+
+	/*
+	 * Enclave is destroyed so scan all status words to find tasks
+	 * where msg gating is in effect (and then turn it off because
+	 * any agent that could have been handling msgs from an earlier
+	 * incarnation is dead).
+	 */
+	for (sw = first_status_word(header);
+	     sw < first_status_word(header) + header->capacity; sw++) {
+		/*
+		 * inuse  canfree
+		 *   0       0		empty slot
+		 *   0       1		not expected (see WARN below)
+		 *   1       0		not expected (see WARN below)
+		 *   1       1		task died or departed (either due to
+		 *			task_reaper or organically while the
+		 *			enclave was being destroyed).
+		 */
+		if (!status_word_inuse(sw)) {
+			WARN_ON_ONCE(status_word_canfree(sw));
+			continue;
+		}
+
+		if (WARN_ON_ONCE(!status_word_canfree(sw)))
+			continue;
+
+		if (!(sw->flags & GHOST_SW_TASK_MSG_GATED)) {
+			/*
+			 * task died while enclave was being destroyed or a
+			 * misbehaving agent did not free status word in its
+			 * TASK_DEAD handler.
+			 */
+			continue;
+		}
+
+		p = __enclave_remove_inhibited_task(swr->enclave, sw->gtid);
+		if (WARN_ON_ONCE(!p))
+			continue;
+
+		ghost_uninhibit_task_msgs(p);
+	}
 
 	list_del(&swr->list);
 
-	vfree(h);
+	vfree(header);
 	kfree(swr);
 
 	/* XXX memcg uncharge */
@@ -2524,9 +2611,9 @@ static size_t calculate_sw_region_size(void)
  *
  * Returns an ERR_PTR on error.
  */
-struct ghost_sw_region *ghost_create_sw_region(struct ghost_enclave *e,
-					       unsigned int id,
-					       unsigned int node)
+static struct ghost_sw_region *ghost_create_sw_region(struct ghost_enclave *e,
+						      unsigned int id,
+						      unsigned int node)
 {
 	struct ghost_sw_region *swr;
 	struct ghost_sw_region_header *h;
@@ -2651,42 +2738,22 @@ out:
 	return ret;
 }
 
-int ghost_sched_fork(struct task_struct *p)
+static int _ghost_sched_fork(struct ghost_enclave *e, struct task_struct *p)
 {
-	struct rq *rq;
-	struct rq_flags rf;
-	int ret;
-	struct ghost_enclave *parent_enclave;
-
-	VM_BUG_ON(!task_has_ghost_policy(p));
-
-	/*
-	 * Another task could be attempting to setsched current out of ghOSt.
-	 * To keep current's enclave valid, we synchronize with the RQ lock.
-	 */
-	rq = task_rq_lock(current, &rf);
-	if (!ghost_policy(current->policy)) {
-		task_rq_unlock(rq, current, &rf);
-		/* It's not quite ECHILD, but it'll tell us where to look. */
-		return -ECHILD;
-	}
-	parent_enclave = current->ghost.enclave;
-	VM_BUG_ON(!parent_enclave);
-	ret = ghost_prep_task(parent_enclave, p, true);
-	task_rq_unlock(rq, current, &rf);
-
-	return ret;
+	return ghost_prep_task(e, p, true);
 }
 
-void ghost_sched_cleanup_fork(struct task_struct *p)
+static void _ghost_sched_cleanup_fork(struct ghost_enclave *e,
+				      struct task_struct *p)
 {
-	struct ghost_queue *q;
 	struct ghost_status_word *sw;
-	struct ghost_enclave *e = p->ghost.enclave;
+	struct ghost_queue *q;
 	ulong flags;
 	int error;
 
 	VM_BUG_ON(!task_has_ghost_policy(p));
+	VM_BUG_ON(e != p->ghost.enclave);
+	VM_BUG_ON(e == NULL);
 
 	/*
 	 * Clear association between 'p' and the default queue.
@@ -2695,6 +2762,15 @@ void ghost_sched_cleanup_fork(struct task_struct *p)
 	if (q != NULL) {
 		p->ghost.dst_q = NULL;
 		queue_decref(q);
+	} else {
+		/*
+		 * Although it is possible for a task to have a no 'dst_q'
+		 * this is expected only for a task that setsched's into
+		 * ghost. For the parent task to fork it must be running
+		 * which means that the enclave was functional with the
+		 * 'def_q' properly configured.
+		 */
+		WARN_ON_ONCE(true);
 	}
 
 	sw = p->ghost.status_word;
@@ -2705,10 +2781,15 @@ void ghost_sched_cleanup_fork(struct task_struct *p)
 		error = free_status_word_locked(e, sw);
 		spin_unlock_irqrestore(&e->lock, flags);
 		VM_BUG_ON(error);
+	} else {
+		WARN_ON_ONCE(true);	/* not expected */
 	}
+
 	if (e) {
 		kref_put(&e->kref, enclave_release);
 		p->ghost.enclave = NULL;
+	} else {
+		WARN_ON_ONCE(true);	/* not expected */
 	}
 }
 
@@ -2738,42 +2819,20 @@ void ghost_sched_cleanup_fork(struct task_struct *p)
  * The most reasonable fix for all of this is to directly call
  * ghost_fdput_enclave() from __sched_setscheduler().
  */
-int ghost_setscheduler(struct task_struct *p, struct rq *rq,
-		       const struct sched_attr *attr,
-		       struct ghost_enclave *new_e,
-		       int *reset_on_fork)
+static int _ghost_setscheduler(struct task_struct *p, struct rq *rq,
+			       const struct sched_attr *attr,
+			       struct ghost_enclave *new_e,
+			       int *reset_on_fork)
 {
-	int oldpolicy = p->policy;
-	int newpolicy = attr->sched_policy;
 	int ret;
 
-	if (WARN_ON_ONCE(!ghost_policy(oldpolicy) && !ghost_policy(newpolicy)))
-		return -EINVAL;
-
-	/*
-	 * If the process is dying, finish_task_switch will call task_dead
-	 * *after* releasing the rq lock.  We don't know if task_dead was called
-	 * yet, and it will be called without holding any locks.  This can break
-	 * ghost for both task scheduling into ghost and out of ghost.
-	 * - If we're entering ghost, but already ran task_dead from our old
-	 *   sched class, then we'll never run ghost_task_dead.
-	 * - If we're leaving ghost, we need to run either ghost_task_dead xor
-	 *   setscheduler from ghost, but we have no nice way of knowing if we
-	 *   already ran ghost_task_dead.
-	 */
-	if (p->state == TASK_DEAD)
-		return -ESRCH;
-	/* Cannot change attributes for a ghost task after creation. */
-	if (oldpolicy == newpolicy)
-		return -EPERM;
-
 	/* Task 'p' is departing the ghost sched class. */
-	if (ghost_policy(oldpolicy)) {
+	if (ghost_policy(p->policy)) {
 		/*
 		 * Don't allow an agent to move out of the ghost sched_class.
 		 * There is no use case for this and more importantly we don't
 		 * apply the side-effects of agent leaving the CPU (compare to
-		 * task_dead_ghost() where we do).
+		 * _task_dead_ghost() where we do).
 		 */
 		if (p->ghost.agent)
 			return -EPERM;
@@ -2782,7 +2841,7 @@ int ghost_setscheduler(struct task_struct *p, struct rq *rq,
 		return 0;
 	}
 
-	if (!new_e)
+	if (WARN_ON_ONCE(!new_e))
 		return -EBADF;
 
 	if (ghost_agent(attr)) {
@@ -2810,27 +2869,6 @@ int ghost_setscheduler(struct task_struct *p, struct rq *rq,
 	}
 
 	return ret;
-}
-
-int ghost_validate_sched_attr(const struct sched_attr *attr)
-{
-	/*
-	 * A thread can only make a task an agent if the thread has the
-         * CAP_SYS_NICE capability.
-	 */
-	switch (attr->sched_priority) {
-		case GHOST_SCHED_TASK_PRIO:
-			return 0;
-		case GHOST_SCHED_AGENT_PRIO:
-			return capable(CAP_SYS_NICE) ? 0 : -EPERM;
-		default:
-			return -EINVAL;
-	}
-}
-
-bool ghost_agent(const struct sched_attr *attr)
-{
-	return attr->sched_priority == GHOST_SCHED_AGENT_PRIO;
 }
 
 /* Makes newq the default for e. */
@@ -2892,17 +2930,24 @@ static const struct file_operations queue_fops = {
 	.mmap			= queue_mmap,
 };
 
-static int ghost_create_queue(int elems, int node, int flags,
-			      ulong __user *mapsize, int e_fd)
+static int ghost_create_queue(struct ghost_enclave *e,
+			      struct ghost_ioc_create_queue __user *arg)
 {
 	ulong size;
-	int error = 0, fd;
+	int error = 0, fd, elems, node, flags;
 	struct ghost_queue *q;
 	struct ghost_queue_header *h;
-	struct ghost_enclave *e;
-	struct fd f_enc = {0};
+	struct ghost_ioc_create_queue create_queue;
 
 	const int valid_flags = 0;	/* no flags for now */
+
+	if (copy_from_user(&create_queue, arg,
+			   sizeof(struct ghost_ioc_create_queue)))
+		return -EFAULT;
+
+	elems = create_queue.elems;
+	node = create_queue.node;
+	flags = create_queue.flags;
 
 	/*
 	 * Validate that 'head' and 'tail' are large enough to distinguish
@@ -2928,20 +2973,14 @@ static int ghost_create_queue(int elems, int node, int flags,
 	size += elems * sizeof(struct ghost_msg);
 	size = PAGE_ALIGN(size);
 
-	error = put_user(size, mapsize);
+	error = put_user(size, &arg->mapsize);
 	if (error)
 		return error;
-
-	e = ghost_fdget_enclave(e_fd, &f_enc);
-	if (!e) {
-		error = -EBADF;
-		goto err_enc_fd;
-	}
 
 	q = kzalloc_node(sizeof(struct ghost_queue), GFP_KERNEL, node);
 	if (!q) {
 		error = -ENOMEM;
-		goto err_alloc_queue;
+		return error;
 	}
 
 	spin_lock_init(&q->lock);
@@ -2978,16 +3017,12 @@ static int ghost_create_queue(int elems, int node, int flags,
 	q->enclave = e;
 	INIT_WORK(&q->free_work, __queue_free_work);
 
-	ghost_fdput_enclave(e, &f_enc);
 	return fd;
 
 err_getfd:
 	vfree(q->addr);
 err_vmalloc:
 	kfree(q);
-err_alloc_queue:
-err_enc_fd:
-	ghost_fdput_enclave(e, &f_enc);
 	return error;
 }
 
@@ -3089,8 +3124,8 @@ static int _get_sw_info(struct ghost_enclave *e,
 	return error;
 }
 
-int ghost_sw_get_info(struct ghost_enclave *e,
-		      struct ghost_ioc_sw_get_info __user *arg)
+static int ghost_sw_get_info(struct ghost_enclave *e,
+			     struct ghost_ioc_sw_get_info __user *arg)
 {
 	int error = -EINVAL;
 	struct task_struct *p;
@@ -3142,10 +3177,14 @@ done:
 	return error;
 }
 
-int ghost_sw_free(struct ghost_enclave *e, struct ghost_sw_info __user *uinfo)
+static int ghost_sw_free(struct ghost_enclave *e,
+			 struct ghost_sw_info __user *uinfo)
 {
 	int error;
+	bool gated;
+	gtid_t gtid;
 	ulong flags;
+	struct task_struct *p = NULL;
 	struct ghost_status_word *sw;
 	struct ghost_sw_info info = { 0 };
 
@@ -3163,14 +3202,22 @@ int ghost_sw_free(struct ghost_enclave *e, struct ghost_sw_info __user *uinfo)
 		error = -EINVAL;
 		goto done;
 	}
+	gtid = sw->gtid;
+	gated = sw->flags & GHOST_SW_TASK_MSG_GATED;
 	error = free_status_word_locked(e, sw);
+	if (!error && gated) {
+		p = __enclave_remove_inhibited_task(e, gtid);
+		WARN_ON_ONCE(!p);
+	}
 done:
 	spin_unlock_irqrestore(&e->lock, flags);
+	if (p)
+		ghost_uninhibit_task_msgs(p);
+
 	return error;
 }
 
-static int ghost_associate_queue(int fd, struct ghost_msg_src __user *usrc,
-				 int barrier, int flags, int *ustatus)
+static int ghost_associate_queue(struct ghost_ioc_assoc_queue __user *arg)
 {
 	int error = 0;
 	struct rq *rq;
@@ -3182,11 +3229,20 @@ static int ghost_associate_queue(int fd, struct ghost_msg_src __user *usrc,
 	struct ghost_queue *oldq, *newq;
 	int status = 0;
 
+	int fd, barrier, flags;
+	struct ghost_ioc_assoc_queue assoc_queue;
+
+	if (copy_from_user(&assoc_queue, arg,
+			   sizeof(struct ghost_ioc_assoc_queue)))
+		return -EFAULT;
+
+	fd = assoc_queue.fd;
+	barrier = assoc_queue.barrier;
+	flags = assoc_queue.flags;
+	src = assoc_queue.src;
+
 	if (flags != 0)			/* no flags for now */
 		return -EINVAL;
-
-	if (copy_from_user(&src, usrc, sizeof(struct ghost_msg_src)))
-		return -EFAULT;
 
 	/* For now only allow changing task-to-queue association. */
 	if (src.type != GHOST_TASK)
@@ -3247,9 +3303,22 @@ static int ghost_associate_queue(int fd, struct ghost_msg_src __user *usrc,
 	if (p->ghost.new_task)
 		status |= GHOST_ASSOC_SF_BRAND_NEW;
 
-	if (ustatus && copy_to_user(ustatus, &status, sizeof(status))) {
-		error = -EFAULT;
-		goto done;
+	/*
+	 * All task msgs may be inhibited (including TASK_NEW) because the
+	 * agent hasn't finished handling TASK_DEPARTED from the previous
+	 * incarnation. This is similar to 'p->ghost.new_task' check above
+	 * in that TASK_NEW will be produced when the status_word from the
+	 * earlier incarnation is freed.
+	 */
+	if (p->inhibit_task_msgs) {
+		/*
+		 * The status_word associated with the previous incarnation
+		 * of the task is orphaned (it cannot be reached from any
+		 * task struct) so we should never see the GATED flag in
+		 * any "live" status_word.
+		 */
+		WARN_ON_ONCE(sw->flags & GHOST_SW_TASK_MSG_GATED);
+		status |= GHOST_ASSOC_SF_BRAND_NEW;
 	}
 
 	queue_incref(newq);
@@ -3261,24 +3330,48 @@ done:
 	if (p)
 		task_rq_unlock(rq, p, &rf);
 	fput(file);
+	/* TODO(b/202070945) */
+	if (!error)
+		error = put_user(status, &arg->status);
+
 	return error;
 }
 
-static int ghost_set_default_queue(int qfd)
+static int ghost_set_default_queue(struct ghost_enclave *e,
+			   struct ghost_ioc_set_default_queue __user *arg)
 {
+	int error = 0;
 	struct fd f_que = {0};
 	struct ghost_queue *newq;
+
+	int qfd;
+	struct ghost_ioc_set_default_queue set_queue;
+
+	if (copy_from_user(&set_queue, arg,
+			   sizeof(struct ghost_ioc_set_default_queue)))
+		return -EFAULT;
+
+	qfd = set_queue.fd;
 
 	f_que = fdget(qfd);
 	newq = fd_to_queue(f_que);
 	if (!newq) {
-		fdput(f_que);
-		return -EBADF;
+		error = -EBADF;
+		goto err_newq;
 	}
-	/* The implied target enclave is whichever newq belongs to. */
-	enclave_set_default_queue(newq->enclave, newq);
+	/*
+	 * Make sure that 'newq' belongs to the same enclave as the one
+	 * whose default queue we are updating.
+	 */
+	if (newq->enclave != e) {
+		error = -EINVAL;
+		goto err_newq;
+	}
+	enclave_set_default_queue(e, newq);
+
+err_newq:
 	fdput(f_que);
-	return 0;
+	return error;
 }
 
 /*
@@ -3352,19 +3445,31 @@ static int agent_target_cpu(struct rq *rq)
 	return target_cpu(agent->ghost.dst_q, task_cpu(agent));
 }
 
-static int ghost_config_queue_wakeup(int qfd,
-				     struct ghost_agent_wakeup __user *w,
-				     int ninfo, int flags)
+static int ghost_config_queue_wakeup(
+		struct ghost_ioc_config_queue_wakeup __user *arg)
 {
 	struct ghost_queue *q;
-	struct queue_notifier *qn, *old;
+	struct queue_notifier *old, *qn = NULL;
 	struct ghost_agent_wakeup wakeup[GHOST_MAX_WINFO];
 	struct file *f;
 	ulong fl;
 	int cpu = -1, i;
 	int ret = 0;
 
-	if (ninfo <= 0 || ninfo > GHOST_MAX_WINFO)
+	int qfd, ninfo, flags;
+	struct ghost_agent_wakeup *w;
+	struct ghost_ioc_config_queue_wakeup config_wakeup;
+
+	if (copy_from_user(&config_wakeup, arg,
+			   sizeof(struct ghost_ioc_config_queue_wakeup)))
+		return -EFAULT;
+
+	qfd = config_wakeup.qfd;
+	w = config_wakeup.w;
+	ninfo = config_wakeup.ninfo;
+	flags = config_wakeup.flags;
+
+	if (ninfo < 0 || ninfo > GHOST_MAX_WINFO)
 		return -EINVAL;
 
 	if (flags)
@@ -3385,26 +3490,28 @@ static int ghost_config_queue_wakeup(int qfd,
 		goto out_fput;
 	}
 
-	if (copy_from_user(&wakeup, w,
-			   sizeof(struct ghost_agent_wakeup) * ninfo)) {
-		ret = -EFAULT;
-		goto out_fput;
-	}
-
-	for (i = 0; i < ninfo; i++) {
-		/* cpu == -1 implies that it is polling for messages. */
-		cpu = wakeup[i].cpu;
-
-		if (wakeup[i].prio || (cpu < -1) || (cpu >= nr_cpu_ids) ||
-		    !cpu_online(cpu)) {
-			ret = -EINVAL;
+	if (ninfo) {
+		if (copy_from_user(&wakeup, w,
+				   sizeof(struct ghost_agent_wakeup) * ninfo)) {
+			ret = -EFAULT;
 			goto out_fput;
 		}
-	}
 
-	qn = kzalloc(sizeof(struct queue_notifier), GFP_KERNEL);
-	memcpy(qn->winfo, wakeup, sizeof(qn->winfo));
-	qn->wnum = ninfo;
+		for (i = 0; i < ninfo; i++) {
+			/* cpu == -1 implies that it is polling for messages. */
+			cpu = wakeup[i].cpu;
+
+			if (wakeup[i].prio || (cpu < -1) ||
+			    (cpu >= nr_cpu_ids) || !cpu_online(cpu)) {
+				ret = -EINVAL;
+				goto out_fput;
+			}
+		}
+
+		qn = kzalloc(sizeof(struct queue_notifier), GFP_KERNEL);
+		memcpy(qn->winfo, wakeup, sizeof(qn->winfo));
+		qn->wnum = ninfo;
+	}
 
 	spin_lock_irqsave(&q->lock, fl);
 	old = rcu_dereference_protected(q->notifier, lockdep_is_held(&q->lock));
@@ -3421,20 +3528,14 @@ out_fput:
 	return ret;
 }
 
-static int ghost_set_option(int option, ulong val1, ulong val2, ulong val3)
-{
-	switch (option) {
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int ghost_get_cpu_time(gtid_t gtid, u64 __user *uruntime)
+static int ghost_get_cpu_time(struct ghost_ioc_get_cpu_time __user *arg)
 {
 	struct task_struct *p;
 	u64 time;
+	gtid_t gtid;
+
+	if (copy_from_user(&gtid, &arg->gtid, sizeof(gtid_t)))
+		return -EFAULT;
 
 	rcu_read_lock();
 	p = find_task_by_gtid(gtid);
@@ -3444,7 +3545,7 @@ static int ghost_get_cpu_time(gtid_t gtid, u64 __user *uruntime)
 	}
 	time = task_sched_runtime(p);
 	rcu_read_unlock();
-	if (copy_to_user(uruntime, &time, sizeof(*uruntime)))
+	if (copy_to_user(&arg->runtime, &time, sizeof(u64)))
 		return -EFAULT;
 	return 0;
 }
@@ -3632,6 +3733,12 @@ static inline int __produce_for_task(struct task_struct *p,
 		WARN(1, "unknown bpg_ghost_msg type %d!\n", msg->type);
 		return -EINVAL;
 	};
+	/*
+	 * XXX for a task that enters ghost into enclave_X but on a cpu
+	 * that belongs to enclave_Y then we'll call the 'bpf_msg_send'
+	 * program attached to enclave_X but any BPF helpers used by the
+	 * program will callback into enclave_Y.
+	 */
 	if (!ghost_bpf_msg_send(p->ghost.enclave, msg))
 		return -ENOMSG;
 	return _produce(p->ghost.dst_q, barrier, msg->type,
@@ -3701,7 +3808,8 @@ static inline bool cpu_deliver_msg_tick(struct rq *rq)
 }
 
 /* Returns true if MSG_CPU_TIMER_EXPIRED was produced and false otherwise */
-static inline bool cpu_deliver_timer_expired(struct rq *rq, uint64_t cookie)
+static inline bool cpu_deliver_timer_expired(struct rq *rq, uint64_t type,
+					     uint64_t cookie)
 {
 	struct bpf_ghost_msg *msg = &per_cpu(bpf_ghost_msg, cpu_of(rq));
 	struct ghost_msg_payload_timer *payload = &msg->timer;
@@ -3711,6 +3819,7 @@ static inline bool cpu_deliver_timer_expired(struct rq *rq, uint64_t cookie)
 
 	msg->type = MSG_CPU_TIMER_EXPIRED;
 	payload->cpu = cpu_of(rq);
+	payload->type = type;
 	payload->cookie = cookie;
 
 	return !produce_for_agent(rq, msg);
@@ -3801,6 +3910,15 @@ static inline int __task_deliver_common(struct rq *rq, struct task_struct *p)
 	task_barrier_inc(rq, p);
 
 	if (!p->ghost.dst_q)
+		return -1;
+
+	/*
+	 * Inhibit tasks msgs until agent acknowledges receipt of an earlier
+	 * TASK_DEPARTED (by freeing the task's status_word). This ensures
+	 * that msgs belonging to the previous incarnation of the task are
+	 * drained before any msg from its current incarnation is produced.
+	 */
+	if (p->inhibit_task_msgs)
 		return -1;
 
 	return 0;
@@ -3921,7 +4039,7 @@ static void task_deliver_msg_departed(struct rq *rq, struct task_struct *p)
 	if (__task_deliver_common(rq, p))
 		return;
 
-	msg->type = MSG_TASK_DEAD;
+	msg->type = MSG_TASK_DEPARTED;
 	payload->gtid = gtid(p);
 	payload->cpu = cpu_of(rq);
 	payload->cpu_seqnum = ++rq->ghost.cpu_seqnum;
@@ -4046,21 +4164,70 @@ static void release_from_ghost(struct rq *rq, struct task_struct *p)
 	/* Remove before potentially clearing p->ghost.agent. */
 	__enclave_remove_task(e, p);
 
-	/*
-	 * Annotate the status_word so it can be freed by the agent.
-	 *
-	 * N.B. this must be ordered before the TASK_DEAD message is
-	 * visible to the agent.
-	 *
-	 * N.B. we grab the enclave lock to prevent a misbehaving agent
-	 * from freeing the status_word (or its enclosing sw_region)
-	 * before delivery of the TASK_DEAD message below.
-	 */
-	ghost_sw_set_flag(p->ghost.status_word, GHOST_SW_F_CANFREE);
-	if (p->state == TASK_DEAD)
-		task_deliver_msg_dead(rq, p);
-	else
+	if (p->inhibit_task_msgs) {
+		/*
+		 * Agent is not going to free the status_word since it
+		 * never saw any msgs associated with this incarnation:
+		 * 1. p->state != TASK_DEAD (task departed)
+		 *    task departed, came back into ghost and departed again
+		 *    before agent had a chance to handle the first DEPARTED.
+		 * 2. p->state == TASK_DEAD (task is dead)
+		 *    task departed and came back into ghost while exiting
+		 *    before agent had a chance to handle the DEPARTED msg.
+		 */
+		free_status_word_locked(e, p->ghost.status_word);
+	} else if (p->state != TASK_DEAD) {
+		/* agents cannot setsched out of ghost */
+		WARN_ON_ONCE(is_agent(rq, p));
+
+		ghost_sw_set_flag(p->ghost.status_word,
+				  GHOST_SW_F_CANFREE|GHOST_SW_TASK_MSG_GATED);
 		task_deliver_msg_departed(rq, p);
+
+		/*
+		 * Inhibit all msgs produced by this task until the agent
+		 * acknowledges receipt of TASK_DEPARTED msg (implicitly by
+		 * freeing the status_word). This ensures that when TASK_NEW
+		 * is produced any msgs associated with an earlier incarnation
+		 * have been consumed.
+		 */
+		p->inhibit_task_msgs = enclave_abi(e);
+
+		/*
+		 * Track the task in the enclave's 'inhibited_task_list'.
+		 *
+		 * We must do this because a departed task can re-enter ghost
+		 * while it is exiting and subsequently lose its identity
+		 * (e.g. see go/kcl/390722). It is possible for the task to
+		 * enter a different enclave in which case the fallback in
+		 * kcl/390722 is ineffective.
+		 *
+		 * TODO: declare enclave failure if agent does not free the
+		 * status_word of a departed task within X msec (X should be
+		 * smaller than the e->max_unscheduled timeout):
+		 * - misbehavior of one enclave should not result in a
+		 *   (false-positive) failure of a different enclave.
+		 * - limit the task_struct memory held hostage while they are
+		 *   on the inhibited_task_list.
+		 */
+		get_task_struct(p);
+		WARN_ON_ONCE(!list_empty(&p->inhibited_task_list));
+		list_add_tail(&p->inhibited_task_list, &e->inhibited_task_list);
+	} else {
+		/*
+		 * Annotate the status_word so it can be freed by the agent.
+		 *
+		 * N.B. this must be ordered before the TASK_DEAD message is
+		 * visible to the agent.
+		 *
+		 * N.B. we grab the enclave lock to prevent a misbehaving agent
+		 * from freeing the status_word (or its enclosing sw_region)
+		 * before delivery of the TASK_DEAD message below.
+		 */
+		ghost_sw_set_flag(p->ghost.status_word, GHOST_SW_F_CANFREE);
+		task_deliver_msg_dead(rq, p);
+	}
+	WARN_ON_ONCE(!p->inhibit_task_msgs && p->state != TASK_DEAD);
 
 	/* status_word is off-limits to the kernel */
 	p->ghost.status_word = NULL;
@@ -4106,11 +4273,22 @@ static void release_from_ghost(struct rq *rq, struct task_struct *p)
 		ghost_claim_and_kill_txn(rq->cpu, GHOST_TXN_NO_AGENT);
 
 		/* See ghost_destroy_enclave() */
-		if (rq->ghost.agent_remove_enclave_cpu) {
-			rq->ghost.agent_remove_enclave_cpu = false;
-			spin_lock(&cpu_rsvp);
-			__enclave_return_cpu(e, rq->cpu);
-			spin_unlock(&cpu_rsvp);
+		if (p->ghost.__agent_decref_enclave) {
+			/* Agents should only exit, never setsched out. */
+			WARN_ON_ONCE(p->state != TASK_DEAD);
+			VM_BUG_ON(p->ghost.__agent_decref_enclave != e);
+			__enclave_remove_cpu(e, rq->cpu);
+			/*
+			 * At this moment, this cpu can be added to a new
+			 * enclave (or our previous enclave!).
+			 *
+			 * Additionally, once we unlock the rq, a new agent task
+			 * can attach to this cpu and use the rq->ghost fields.
+			 *
+			 * We've set pcpu->enclave = NULL (step 1).  Steps 2 and
+			 * 3 (sync rcu and decref) are handled when we return to
+			 * _task_dead_ghost() call_rcu.
+			 */
 		}
 	}
 
@@ -4136,10 +4314,18 @@ static void ghost_delayed_put_task_struct(struct rcu_head *rhp)
 {
 	struct task_struct *tsk = container_of(rhp, struct task_struct,
 					       ghost.rcu);
+	/*
+	 * Step 3 of "destroyed with agent": decref.
+	 * See ghost_destroy_enclave().
+	 */
+	if (tsk->ghost.__agent_decref_enclave) {
+		kref_put(&tsk->ghost.__agent_decref_enclave->kref,
+			 enclave_release);
+	}
 	put_task_struct(tsk);
 }
 
-static void task_dead_ghost(struct task_struct *p)
+static void _task_dead_ghost(struct task_struct *p)
 {
 	struct rq_flags rf;
 	struct rq *rq;
@@ -4288,7 +4474,7 @@ static void ghost_wake_agent_on(int cpu)
 	put_cpu();
 }
 
-int ghost_wake_agent_on_check(int cpu)
+static int ghost_wake_agent_on_check(int cpu)
 {
 	int this_cpu = get_cpu();
 	int ret;
@@ -4299,7 +4485,7 @@ int ghost_wake_agent_on_check(int cpu)
 	return ret;
 }
 
-void ghost_wake_agent_of(struct task_struct *p)
+static void ghost_wake_agent_of(struct task_struct *p)
 {
 	ghost_wake_agent_on(task_target_cpu(p));
 }
@@ -4312,15 +4498,15 @@ static void _ghost_task_preempted(struct rq *rq, struct task_struct *p,
 	lockdep_assert_held(&rq->lock);
 	VM_BUG_ON(task_rq(p) != rq);
 
-       /*
-        * When TASK_PREEMPTED is produced before returning from pick_next_task
-        * (e.g. via pick_next_ghost_agent) we don't have an up-to-date runtime
-        * since put_prev_task() hasn't been called yet.
-        *
-        * Therefore if 'p == rq->curr' we must do update_curr_ghost() by hand.
-        */
-       if (p == rq->curr)
-               update_curr_ghost(rq);
+	/*
+	 * When TASK_PREEMPTED is produced before returning from pick_next_task
+	 * (e.g. via pick_next_ghost_agent) we don't have an up-to-date runtime
+	 * since put_prev_task() hasn't been called yet.
+	 *
+	 * Therefore if 'p == rq->curr' we must do _update_curr_ghost() by hand.
+	 */
+	if (p == rq->curr)
+		_update_curr_ghost(rq);
 
 	/*
 	 * If a latched task was preempted then by definition it was not
@@ -4343,7 +4529,7 @@ static void _ghost_task_preempted(struct rq *rq, struct task_struct *p,
 		schedule_agent(rq, false);
 }
 
-void ghost_task_preempted(struct rq *rq, struct task_struct *p)
+static void ghost_task_preempted(struct rq *rq, struct task_struct *p)
 {
 	lockdep_assert_held(&rq->lock);
 	VM_BUG_ON(task_rq(p) != rq);
@@ -4351,7 +4537,7 @@ void ghost_task_preempted(struct rq *rq, struct task_struct *p)
 	_ghost_task_preempted(rq, p, false);
 }
 
-void ghost_task_got_oncpu(struct rq *rq, struct task_struct *p)
+static void ghost_task_got_oncpu(struct rq *rq, struct task_struct *p)
 {
 	lockdep_assert_held(&rq->lock);
 	VM_BUG_ON(task_rq(p) != rq);
@@ -4375,14 +4561,14 @@ static void _ghost_task_new(struct rq *rq, struct task_struct *p, bool runnable)
 
 	enclave_add_task(p->ghost.enclave, p);
 
-       /* See explanation in ghost_task_preempted() */
-       if (p == rq->curr)
-               update_curr_ghost(rq);
+	/* See explanation in ghost_task_preempted() */
+	if (p == rq->curr)
+		_update_curr_ghost(rq);
 
 	task_deliver_msg_task_new(rq, p, runnable);
 }
 
-void ghost_task_new(struct rq *rq, struct task_struct *p)
+static void ghost_task_new(struct rq *rq, struct task_struct *p)
 {
 	_ghost_task_new(rq, p, task_on_rq_queued(p));
 }
@@ -4392,9 +4578,9 @@ static void ghost_task_yield(struct rq *rq, struct task_struct *p)
 	lockdep_assert_held(&rq->lock);
 	VM_BUG_ON(task_rq(p) != rq);
 
-       /* See explanation in ghost_task_preempted() */
-       if (p == rq->curr)
-               update_curr_ghost(rq);
+	/* See explanation in ghost_task_preempted() */
+	if (p == rq->curr)
+		_update_curr_ghost(rq);
 
 	task_deliver_msg_yield(rq, p);
 }
@@ -4407,7 +4593,7 @@ static void ghost_task_blocked(struct rq *rq, struct task_struct *p)
 	task_deliver_msg_blocked(rq, p);
 }
 
-void ghost_wait_for_rendezvous(struct rq *rq)
+static void wait_for_rendezvous(struct rq *rq)
 {
 	int64_t target;
 
@@ -4539,8 +4725,7 @@ static inline bool commit_flags_valid(int commit_flags, int valid_commit_flags)
  *
  * Return 0 on success and -1 on failure.
  */
-SYSCALL_DEFINE5(ghost_run, s64, gtid, u32, agent_barrier,
-		u32, task_barrier, int, run_cpu, int, run_flags)
+static int ghost_run(struct ghost_enclave *e, struct ghost_ioc_run __user *arg)
 {
 	struct task_struct *agent;
 	struct rq_flags rf;
@@ -4548,10 +4733,26 @@ SYSCALL_DEFINE5(ghost_run, s64, gtid, u32, agent_barrier,
 	int error = 0;
 	int this_cpu;
 
+	s64 gtid;
+	u32 agent_barrier;
+	u32 task_barrier;
+	int run_cpu;
+	int run_flags;
+	struct ghost_ioc_run run_params;
+
 	const int supported_flags = RTLA_ON_IDLE;
 
 	if (!capable(CAP_SYS_NICE))
 		return -EPERM;
+
+	if (copy_from_user(&run_params, arg, sizeof(struct ghost_ioc_run)))
+		return -EFAULT;
+
+	gtid = run_params.gtid;
+	agent_barrier = run_params.agent_barrier;
+	task_barrier = run_params.task_barrier;
+	run_cpu = run_params.run_cpu;
+	run_flags = run_params.run_flags;
 
 	if (run_cpu < 0 || run_cpu >= nr_cpu_ids || !cpu_online(run_cpu))
 		return -EINVAL;
@@ -4757,31 +4958,6 @@ static int __ghost_run_gtid_on(gtid_t gtid, u32 task_barrier, int run_flags,
 	task_rq_unlock(rq, next, &rf);
 
 	return 0;
-}
-
-/*
- * Attempts to run gtid on cpu.  Returns 0 or -error.
- *
- * Called from BPF helpers.  The programs that can call those helpers are
- * explicitly allowed in ghost_sched_func_proto.
- */
-int ghost_run_gtid_on(gtid_t gtid, u32 task_barrier, int run_flags, int cpu)
-{
-	return __ghost_run_gtid_on(gtid, task_barrier, run_flags, cpu,
-				   /*check_caller_enclave=*/ false);
-}
-
-/*
- * Attempts to run gtid on cpu.  Returns 0 or -error.
- *
- * Like ghost_run_gtid_on, but checks that the calling CPU and the target cpu
- * are in the same enclave.
- */
-int ghost_run_gtid_on_check(gtid_t gtid, u32 task_barrier, int run_flags,
-			    int cpu)
-{
-	return __ghost_run_gtid_on(gtid, task_barrier, run_flags, cpu,
-				   /*check_caller_enclave=*/ true);
 }
 
 static inline bool _ghost_txn_ready(int cpu, int *commit_flags)
@@ -5067,6 +5243,11 @@ static bool _ghost_commit_txn(int run_cpu, bool sync, int64_t rendezvous,
 	 */
 	if (unlikely(!rq->ghost.agent)) {
 		state = GHOST_TXN_NO_AGENT;
+		goto out;
+	}
+
+	if (unlikely(!rcu_dereference_sched(per_cpu(enclave, cpu_of(rq))))) {
+		state = GHOST_TXN_CPU_UNAVAIL;
 		goto out;
 	}
 
@@ -5376,9 +5557,13 @@ static void ghost_commit_pending_txn(int where)
 	put_cpu();
 }
 
-extern void ghost_commit_greedy_txn(void)
+static void _commit_greedy_txn(int cpu)
 {
-	ghost_commit_pending_txn(0);	/* Commit a greedy pending txn */
+	WARN_ON_ONCE(preemptible());
+
+	rcu_read_lock();
+	_ghost_commit_pending_txn(cpu, /*where=*/0);
+	rcu_read_unlock();
 }
 
 void ghost_commit_all_greedy_txns(void)
@@ -5413,7 +5598,7 @@ void ghost_commit_all_greedy_txns(void)
 	 * Note that e's cpu mask could be changed concurrently, with cpus added
 	 * or removed.  This is benign.  First, any commits will look at the
 	 * rcu-protected ghost_txn pointer.  That's what really matters, and
-	 * any caller to __enclave_unpublish_cpu() will synchronize_rcu().
+	 * any caller to __enclave_remove_cpu() will synchronize_rcu().
 	 *
 	 * Furthermore, if a cpu is added while we are looking (which is not
 	 * protected by RCU), it's not a big deal.  This is a greedy commit, and
@@ -5447,26 +5632,8 @@ static void ghost_reached_rendezvous(int cpu, int64_t target)
 	smp_store_release(&rq->ghost.rendezvous, target);
 }
 
-/*
- * A sync-group cookie uniquely identifies a sync-group commit.
- *
- * It is useful to identify the initiator and participants of the sync-group.
- */
-static inline int64_t ghost_sync_group_cookie(void)
-{
-	int64_t val;
-
-	WARN_ON_ONCE(preemptible());
-	BUILD_BUG_ON(NR_CPUS > (1U << SG_COOKIE_CPU_BITS));
-
-	val = __this_cpu_inc_return(sync_group_cookie);
-	VM_BUG_ON((val <= 0) || (val & GHOST_POISONED_RENDEZVOUS));
-
-	return val;
-}
-
-static int gsys_ghost_sync_group(ulong __user *user_mask_ptr,
-				 uint user_mask_len, int flags)
+static int ghost_sync_group(struct ghost_enclave *e,
+			    struct ghost_ioc_commit_txn __user *arg)
 {
 	int64_t target;
 	bool failed = false;
@@ -5474,7 +5641,20 @@ static int gsys_ghost_sync_group(ulong __user *user_mask_ptr,
 	int cpu, this_cpu, error, state;
 	cpumask_var_t cpumask, ipimask, rendmask;
 
+	ulong *user_mask_ptr;
+	uint user_mask_len;
+	int flags;
+	struct ghost_ioc_commit_txn commit_txn;
+
 	const int valid_flags = 0;
+
+	if (copy_from_user(&commit_txn, arg,
+			   sizeof(struct ghost_ioc_commit_txn)))
+		return -EFAULT;
+
+	user_mask_ptr = commit_txn.mask_ptr;
+	user_mask_len = commit_txn.mask_len;
+	flags = commit_txn.flags;
 
 	if (flags & ~valid_flags)
 		return -EINVAL;
@@ -5663,8 +5843,8 @@ static int gsys_ghost_sync_group(ulong __user *user_mask_ptr,
 	return !failed;
 }
 
-static int gsys_ghost_commit_txn(ulong __user *user_mask_ptr,
-				 uint user_mask_len, int flags)
+static int ioctl_ghost_commit_txn(struct ghost_enclave *e,
+				  struct ghost_ioc_commit_txn __user *arg)
 {
 	int error, state;
 	int cpu, this_cpu;
@@ -5672,7 +5852,20 @@ static int gsys_ghost_commit_txn(ulong __user *user_mask_ptr,
 	bool local_resched = false;
 	cpumask_var_t cpumask, ipimask;
 
+	ulong *user_mask_ptr;
+	uint user_mask_len;
+	int flags;
+	struct ghost_ioc_commit_txn commit_txn;
+
 	const int valid_flags = 0;
+
+	if (copy_from_user(&commit_txn, arg,
+			   sizeof(struct ghost_ioc_commit_txn)))
+		return -EFAULT;
+
+	user_mask_ptr = commit_txn.mask_ptr;
+	user_mask_len = commit_txn.mask_len;
+	flags = commit_txn.flags;
 
 	if (flags & ~valid_flags)
 		return -EINVAL;
@@ -5819,28 +6012,44 @@ static int ghost_timerfd_validate(struct timerfd_ghost *timerfd_ghost)
 
 /* fs/timerfd.c */
 int do_timerfd_settime(int ufd, int flags, const struct itimerspec64 *new,
-		       struct itimerspec64 *old, struct timerfd_ghost *tfdl);
+		       struct itimerspec64 *old,
+		       struct __kernel_timerfd_ghost *ktfd);
 
-static int ghost_timerfd_settime(int timerfd, int flags,
-				 const struct __kernel_itimerspec __user *utmr,
-				 struct __kernel_itimerspec __user *otmr,
-				 struct timerfd_ghost __user *utfdl)
+static int ghost_timerfd_settime(struct ghost_ioc_timerfd_settime __user *arg)
 {
-	struct timerfd_ghost timerfd_ghost;
 	struct itimerspec64 new, old;
 	int ret;
 
-	if (get_itimerspec64(&new, utmr))
+	int timerfd, flags;
+	const struct __kernel_itimerspec *itmr;
+	struct __kernel_itimerspec *otmr;
+	struct timerfd_ghost timerfd_ghost;
+	struct ghost_ioc_timerfd_settime settime_data;
+	struct __kernel_timerfd_ghost ktfd_ghost;
+
+	if (copy_from_user(&settime_data, arg,
+			   sizeof(struct ghost_ioc_timerfd_settime)))
 		return -EFAULT;
 
-	if (copy_from_user(&timerfd_ghost, utfdl, sizeof(timerfd_ghost)))
+	timerfd = settime_data.timerfd;
+	flags = settime_data.flags;
+	itmr = settime_data.in_tmr;
+	otmr = settime_data.out_tmr;
+	timerfd_ghost = settime_data.timerfd_ghost;
+
+	if (get_itimerspec64(&new, itmr))
 		return -EFAULT;
 
 	ret = ghost_timerfd_validate(&timerfd_ghost);
 	if (ret)
 		return ret;
 
-	ret = do_timerfd_settime(timerfd, flags, &new, &old, &timerfd_ghost);
+	ktfd_ghost.enabled = timerfd_ghost.flags & TIMERFD_GHOST_ENABLED;
+	ktfd_ghost.cpu = timerfd_ghost.cpu;
+	ktfd_ghost.type = timerfd_ghost.type;
+	ktfd_ghost.cookie = timerfd_ghost.cookie;
+
+	ret = do_timerfd_settime(timerfd, flags, &new, &old, &ktfd_ghost);
 	if (ret)
 		return ret;
 
@@ -5850,12 +6059,10 @@ static int ghost_timerfd_settime(int timerfd, int flags,
 	return ret;
 }
 
-/* Called from timerfd_triggered() on timer expiry */
-void ghost_timerfd_triggered(struct timerfd_ghost *timerfd_ghost)
+static void _ghost_timerfd_triggered(int cpu, uint64_t type, uint64_t cookie)
 {
 	struct rq *rq;
 	struct rq_flags rf;
-	int cpu = timerfd_ghost->cpu;
 
 	if (WARN_ON_ONCE(cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu)))
 		return;
@@ -5863,151 +6070,26 @@ void ghost_timerfd_triggered(struct timerfd_ghost *timerfd_ghost)
 	rq = cpu_rq(cpu);
 	rq_lock_irqsave(rq, &rf);
 
-	if (cpu_deliver_timer_expired(rq, timerfd_ghost->cookie))
+	if (cpu_deliver_timer_expired(rq, type, cookie))
 		ghost_wake_agent_on(agent_target_cpu(rq));
 
 	rq_unlock_irqrestore(rq, &rf);
-}
-
-static int ghost_gtid_lookup(int64_t id, int op, int flags, int64_t __user *out)
-{
-	int error = 0;
-	int64_t result;
-	struct task_struct *target;
-
-	if (flags)
-		return -EINVAL;
-
-	rcu_read_lock();
-	target = find_task_by_gtid(id);
-	if (!target) {
-		rcu_read_unlock();
-		return -ESRCH;
-	}
-
-	switch (op) {
-	case GHOST_GTID_LOOKUP_TGID:
-		result = task_tgid_nr(target);
-		break;
-	default:
-		error = -EINVAL;
-		break;
-	}
-	rcu_read_unlock();
-
-	if (!error) {
-		if (copy_to_user(out, &result, sizeof(result)))
-			error = -EFAULT;
-	}
-
-	return error;
-}
-
-static int ghost_get_gtid(int64_t __user *out)
-{
-	gtid_t gtid = current->gtid;
-
-	if (copy_to_user(out, &gtid, sizeof(gtid)))
-		return -EFAULT;
-
-	return 0;
-}
-
-/* Null syscall for benchmarking */
-static int ghost_null(bool lookup_e, int e_fd)
-{
-	struct ghost_enclave *e;
-	struct fd f_enc = {0};
-	int ret = 0;
-
-	if (!lookup_e)
-		return 0;
-	e = ghost_fdget_enclave(e_fd, &f_enc);
-	if (!e)
-		ret = -EBADF;
-	ghost_fdput_enclave(e, &f_enc);
-	return ret;
-}
-
-/*
- * TODO: Access to the ghost syscalls needs to be restricted, probably via a
- * capability.
- */
-SYSCALL_DEFINE6(ghost, u64, op, u64, arg1, u64, arg2,
-		u64, arg3, u64, arg4, u64, arg5)
-{
-	bool be_nice = true;
-
-	if (op == GHOST_GET_GTID_10 || op == GHOST_GET_GTID_11 ||
-	    op == GHOST_BASE_GET_GTID)
-		be_nice = false;
-
-	if (be_nice && !capable(CAP_SYS_NICE))
-		return -EPERM;
-
-	switch (op) {
-	case GHOST_NULL:
-		return ghost_null(arg1, arg2);
-	case GHOST_CREATE_QUEUE:
-		return ghost_create_queue(arg1, arg2, arg3,
-					  (ulong __user *)arg4, arg5);
-	case GHOST_ASSOCIATE_QUEUE:
-		return ghost_associate_queue(arg1, (void *)arg2, arg3, arg4,
-					     (int __user *)arg5);
-	case GHOST_SET_DEFAULT_QUEUE:
-		return ghost_set_default_queue(arg1);
-	case GHOST_CONFIG_QUEUE_WAKEUP:
-		return ghost_config_queue_wakeup(arg1,
-						 (struct ghost_agent_wakeup __user *) arg2,
-						 arg3, arg4);
-	case GHOST_SET_OPTION:
-		return ghost_set_option(arg1, arg2, arg3, arg4);
-	case GHOST_GET_CPU_TIME:
-		return ghost_get_cpu_time((gtid_t)arg1, (u64 __user *)arg2);
-	case GHOST_COMMIT_TXN:
-		return gsys_ghost_commit_txn((ulong __user *)arg1, arg2, arg3);
-	case GHOST_SYNC_GROUP_TXN:
-		return gsys_ghost_sync_group((ulong __user *)arg1, arg2, arg3);
-	case GHOST_TIMERFD_SETTIME:
-		return ghost_timerfd_settime(arg1, arg2,
-				(const struct __kernel_itimerspec __user *)arg3,
-				(struct __kernel_itimerspec __user *)arg4,
-				(struct timerfd_ghost __user *)arg5);
-	case GHOST_GTID_LOOKUP:
-		return ghost_gtid_lookup(arg1, arg2, arg3,
-					 (int64_t __user *)arg4);
-	case GHOST_GET_GTID_10:
-	case GHOST_GET_GTID_11:
-	case GHOST_BASE_GET_GTID:
-		return ghost_get_gtid((int64_t __user *)arg1);
-	default:
-		if (op >= _GHOST_BASE_OP_FIRST)
-			return -EOPNOTSUPP;
-		else
-			return -EINVAL;
-	}
 }
 
 #ifndef SYS_SWITCHTO_SWITCH_FLAGS_LAZY_EXEC_CLOCK
 #define SYS_SWITCHTO_SWITCH_FLAGS_LAZY_EXEC_CLOCK	0x10000
 #endif
 
-void ghost_switchto(struct rq *rq, struct task_struct *prev,
-		    struct task_struct *next, int switchto_flags)
+static void _ghost_switchto(struct rq *rq, struct task_struct *prev,
+			    struct task_struct *next, int switchto_flags)
 {
-	lockdep_assert_held(&rq->lock);
-	VM_BUG_ON(prev != rq->curr);
-	VM_BUG_ON(prev->state == TASK_RUNNING);
-	VM_BUG_ON(next->state == TASK_RUNNING);
-	VM_BUG_ON(!ghost_class(prev->sched_class));
-	VM_BUG_ON(!ghost_class(next->sched_class));
 	VM_BUG_ON(rq->ghost.check_prev_preemption);
 	VM_BUG_ON(rq->ghost.switchto_count < 0);
 
 	if (switchto_flags & SYS_SWITCHTO_SWITCH_FLAGS_LAZY_EXEC_CLOCK) {
 		next->se.exec_start = prev->se.exec_start;
 	} else {
-		update_curr_ghost(rq);
+		_update_curr_ghost(rq);
 		next->se.exec_start = rq_clock_task(rq);
 	}
 
@@ -6030,18 +6112,15 @@ void ghost_switchto(struct rq *rq, struct task_struct *prev,
 	}
 }
 
-void ghost_need_cpu_not_idle(struct rq *rq, struct task_struct *next)
+static void ghost_need_cpu_not_idle(struct rq *rq, struct task_struct *next)
 {
 	if (cpu_deliver_msg_not_idle(rq, next))
 		ghost_wake_agent_on(agent_target_cpu(rq));
 }
 
-void ghost_cpu_idle(void)
+static void cpu_idle(struct rq *rq)
 {
-	struct rq *rq = this_rq();
 	struct rq_flags rf;
-
-	WARN_ON_ONCE(current != rq->idle);
 
 	rq_lock_irq(rq, &rf);
 	if (rq->ghost.dont_idle_once) {
@@ -6052,51 +6131,1311 @@ void ghost_cpu_idle(void)
 	rq_unlock_irq(rq, &rf);
 }
 
-unsigned long ghost_cfs_added_load(struct rq *rq)
+/* Helper for when you "echo foo > ctl" without the -n. */
+static void strip_slash_n(char *buf, size_t count)
 {
-	int ghost_nr_running = rq->ghost.ghost_nr_running;
-	struct task_struct *curr;
-	bool add_load = false;
+	char *n = strnchr(buf, count, '\n');
 
-	/* No ghost tasks; nothing to contribute load. */
-	if (!ghost_nr_running)
-		return 0;
+	if (n)
+		*n = '\0';
+}
+
+struct gf_dirent {
+	char			*name;
+	umode_t			mode;
+	struct kernfs_ops	*ops;
+	loff_t			size;
+	bool			is_dir;
+};
+
+/*
+ * Finds a specific file in a directory table.  This is useful for runtime
+ * initialization, though keep in mind the dirtab is a global structure.
+ */
+static struct gf_dirent *gf_find_file(struct gf_dirent *dirtab,
+				      const char *name)
+{
+	struct gf_dirent *gft;
+
+	for (gft = dirtab; gft->name; gft++) {
+		if (!strcmp(gft->name, name))
+			return gft;
+	}
+	return NULL;
+}
+
+/*
+ * Every open file in an enclave holds a kref on the enclave.  This includes the
+ * ctl, txn, the status words, etc.
+ *
+ * Each of those file's priv points to the enclave struct, either directly or
+ * indirectly.  For instance, the SW files have their own object that points to
+ * the enclave.  We can differentiate which file is which based on the kernfs
+ * ops.  In some cases, we can reuse ops and differentiate on the object's name.
+ *
+ * This does not include the enclave directory; it's priv is NULL, and it has no
+ * function ops.
+ *
+ * Destroying the enclave involves removing it from the filesystem by writing
+ * "destroy" into ctl.  That triggers kernfs_remove() and whatever things we
+ * want to do for the enclave itself, like killing the agents.  The enclave
+ * object will exist until the last FD is closed.  Note that when we call
+ * kernfs_remove(), it'll "drain" any open files, which involves unmapping any
+ * mmapped files.
+ *
+ * Most of the heavy lifting for destroying an enclave is done in
+ * ghost_destroy_enclave().  The kernel scheduler may call that function at any
+ * moment if it determines an enclave misbehaved.
+ */
+
+static struct ghost_enclave *of_to_e(struct kernfs_open_file *of)
+{
+	return of->kn->priv;
+}
+
+static struct ghost_enclave *seq_to_e(struct seq_file *sf)
+{
+	struct kernfs_open_file *of = sf->private;
+
+	return of_to_e(of);
+}
+
+/* For enclave files whose priv directly points to a ghost enclave. */
+static int gf_e_open(struct kernfs_open_file *of)
+{
+	struct ghost_enclave *e = of_to_e(of);
 
 	/*
-	 * We have a few cases where we want to add load:
-	 * (a): We have a local agent that is not blocked_in_run.
-	 * (b): Currently have a non-agent ghost task running.
-	 * (c): Have a latched task that is not yet running. We
-	 * treat this the same as case (b), since this is really
-	 * just a race over getting through schedule() (modulo possible
-	 * preemption by another sched_class).
+	 * kernfs open can grab kernfs_mutex, which is a potential deadlock
+	 * scenario.  agent's should open files from CFS.
 	 */
+	WARN_ON_ONCE(is_agent(task_rq(current), current));
 
-	if (ghost_nr_running > __ghost_extra_nr_running(rq)) {
-		/* (a) */
-		add_load = true;
-		goto out;
-	}
-
-	rcu_read_lock();
-	curr = READ_ONCE(rq->curr);
-	if (task_has_ghost_policy(curr) && !is_agent(rq, curr) &&
-	    curr->state == TASK_RUNNING) {
-		/* (b) */
-		add_load = true;
-	}
-	curr = NULL; /* don't use outside of RCU */
-	rcu_read_unlock();
-	if (add_load)
-		goto out;
-
-	if (rq->ghost.latched_task) {
-		/* (c) */
-		add_load = true;
-	}
-
-out:
-	if (add_load)
-		return sysctl_ghost_cfs_load_added;
+	kref_get(&e->kref);
 	return 0;
 }
+
+/* For enclave files whose priv directly points to a ghost enclave. */
+static void gf_e_release(struct kernfs_open_file *of)
+{
+	struct ghost_enclave *e = of_to_e(of);
+
+	kref_put(&e->kref, enclave_release);
+}
+
+/*
+ * There can be at most one writable open, and there can be any number of
+ * read-only opens.
+ *
+ * If there is a writable open, that means userspace has advertised this enclave
+ * as having an agent_online, and the value of agent_online will change
+ * accordingly.
+ */
+static int gf_agent_online_open(struct kernfs_open_file *of)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	unsigned long irq_fl;
+
+	if (!(of->file->f_mode & FMODE_WRITE))
+		goto done;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	if (e->agent_online) {
+		spin_unlock_irqrestore(&e->lock, irq_fl);
+		return -EBUSY;
+	}
+	e->agent_online = true;
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+
+	kernfs_notify(of->kn);
+
+done:
+	kref_get(&e->kref);
+	return 0;
+}
+
+static void gf_agent_online_release(struct kernfs_open_file *of)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	unsigned long irq_fl;
+
+	if (!(of->file->f_mode & FMODE_WRITE))
+		goto done;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	WARN_ONCE(!e->agent_online,
+		  "closing RW agent_online for enclave_%lu, but it's not online!",
+		  e->id);
+	e->agent_online = false;
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+
+	/*
+	 * Kicks any epoll/notifiers about the change in state.  This is the
+	 * "agent death edge".
+	 *
+	 * Note that this doesn't necessarily mean the enclave will be
+	 * destroyed, merely that userspace no longer thinks there is a valid
+	 * agent.  This FD was probably closed because the agent crashed.
+	 */
+	kernfs_notify(of->kn);
+
+done:
+	kref_put(&e->kref, enclave_release);
+}
+
+static int gf_agent_online_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	seq_printf(sf, "%u", e->agent_online ? 1 : 0);
+	return 0;
+}
+
+static ssize_t gf_agent_online_write(struct kernfs_open_file *of, char *buf,
+				     size_t bytes, loff_t off)
+{
+	/* We need a write op so kernfs allows us to be opened for writing. */
+	return -EINVAL;
+}
+
+static struct kernfs_ops gf_ops_e_agent_online = {
+	.open			= gf_agent_online_open,
+	.release		= gf_agent_online_release,
+	.seq_show		= gf_agent_online_show,
+	.write			= gf_agent_online_write,
+};
+
+static int gf_cpu_data_mmap(struct kernfs_open_file *of,
+			       struct vm_area_struct *vma)
+{
+	struct ghost_enclave *e = of_to_e(of);
+
+	return ghost_cpu_data_mmap(of->file, vma, e->cpu_data,
+				   of->kn->attr.size);
+}
+
+static struct kernfs_ops gf_ops_e_cpu_data = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.mmap			= gf_cpu_data_mmap,
+};
+
+/* Returns an ASCII list of the cpus in the enclave */
+static ssize_t gf_cpulist_read(struct kernfs_open_file *of, char *buf,
+			       size_t bytes, loff_t off)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	unsigned long fl;
+	cpumask_var_t cpus;
+	char *pagebuf;
+	ssize_t strlen;
+
+	if (off > PAGE_SIZE)
+		return -EINVAL;
+	bytes = min_t(size_t, bytes, PAGE_SIZE - off);
+
+	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
+		return -ENOMEM;
+
+	spin_lock_irqsave(&e->lock, fl);
+	memcpy(cpus, &e->cpus, cpumask_size());
+	spin_unlock_irqrestore(&e->lock, fl);
+
+	pagebuf = (char *)get_zeroed_page(GFP_KERNEL);
+	if (!pagebuf) {
+		free_cpumask_var(cpus);
+		return -ENOMEM;
+	}
+
+	strlen = cpumap_print_to_pagebuf(/*list=*/true, pagebuf, cpus);
+	bytes = memory_read_from_buffer(buf, bytes, &off, pagebuf, strlen);
+
+	free_page((unsigned long)pagebuf);
+	free_cpumask_var(cpus);
+
+	return bytes;
+}
+
+
+static ssize_t __cpu_set_write(struct kernfs_open_file *of, char *buf,
+			       size_t bytes, loff_t off, bool is_list)
+{
+	cpumask_var_t cpus;
+	int err;
+
+	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
+		return -ENOMEM;
+	if (is_list)
+		err = cpulist_parse(buf, cpus);
+	else
+		err = cpumask_parse(buf, cpus);
+	if (err) {
+		free_cpumask_var(cpus);
+		return err;
+	}
+	err = ghost_enclave_set_cpus(of_to_e(of), cpus);
+	free_cpumask_var(cpus);
+	return err ? err : bytes;
+}
+
+/* Sets the enclave's cpus to buf, an ASCII list of cpus. */
+static ssize_t gf_cpulist_write(struct kernfs_open_file *of, char *buf,
+				size_t bytes, loff_t off)
+{
+	return __cpu_set_write(of, buf, bytes, off, /*is_list=*/true);
+}
+
+static struct kernfs_ops gf_ops_e_cpulist = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.read			= gf_cpulist_read,
+	.write			= gf_cpulist_write,
+};
+
+/* Returns an ASCII hex mask of the cpus in the enclave */
+static ssize_t gf_cpumask_read(struct kernfs_open_file *of, char *buf,
+			       size_t bytes, loff_t off)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	unsigned long fl;
+	cpumask_var_t cpus;
+	char *mask_str;
+	int len;
+
+	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
+		return -ENOMEM;
+
+	spin_lock_irqsave(&e->lock, fl);
+	memcpy(cpus, &e->cpus, cpumask_size());
+	spin_unlock_irqrestore(&e->lock, fl);
+
+	/*
+	 * +1 for the \0.  We won't return the \0 to userspace, but the string
+	 * will be null-terminated while in the kernel.
+	 */
+	len = snprintf(NULL, 0, "%*pb\n", cpumask_pr_args(cpus)) + 1;
+	mask_str = kmalloc(len, GFP_KERNEL);
+	if (!mask_str) {
+		free_cpumask_var(cpus);
+		return -ENOMEM;
+	}
+	len = snprintf(mask_str, len, "%*pb\n", cpumask_pr_args(cpus));
+	bytes = memory_read_from_buffer(buf, bytes, &off, mask_str, len);
+
+	kfree(mask_str);
+	free_cpumask_var(cpus);
+
+	return bytes;
+}
+
+/* Sets the enclave's cpus to buf, an ASCII hex cpumask. */
+static ssize_t gf_cpumask_write(struct kernfs_open_file *of, char *buf,
+				size_t bytes, loff_t off)
+{
+	return __cpu_set_write(of, buf, bytes, off, /*is_list=*/false);
+}
+
+static struct kernfs_ops gf_ops_e_cpumask = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.read			= gf_cpumask_read,
+	.write			= gf_cpumask_write,
+};
+
+static int gf_ctl_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	seq_printf(sf, "%lu", e->id);
+	return 0;
+}
+
+static void destroy_enclave(struct kernfs_open_file *ctl_of)
+{
+	struct kernfs_node *ctl = ctl_of->kn;
+	struct ghost_enclave *e = of_to_e(ctl_of);
+
+	/*
+	 * kernfs_remove() works recursively, removing the entire enclave
+	 * directory.  We need to remove the ctl file first, since we're in the
+	 * middle of a kn op.
+	 *
+	 * Multiple threads can call kernfs_remove_self() at once.  Whichever
+	 * succeeds will remove the directory and release e.
+	 */
+	if (!kernfs_remove_self(ctl))
+		return;
+	if (WARN_ON(ctl->parent != e->enclave_dir))
+		return;
+	ghost_destroy_enclave(e);
+}
+
+static struct ghost_sw_region *of_to_swr(struct kernfs_open_file *of)
+{
+	return of->kn->priv;
+}
+
+/*
+ * swr_kns refcount the enclave, even though they point to the swr.  An swr will
+ * never be deleted until the enclave is released.
+ */
+static int gf_swr_open(struct kernfs_open_file *of)
+{
+	struct ghost_sw_region *swr = of_to_swr(of);
+
+	/*
+	 * kernfs open can grab kernfs_mutex, which is a potential deadlock
+	 * scenario.  agent's should open files from CFS.
+	 */
+	WARN_ON_ONCE(is_agent(task_rq(current), current));
+
+	kref_get(&swr->enclave->kref);
+	return 0;
+}
+
+static void gf_swr_release(struct kernfs_open_file *of)
+{
+	struct ghost_sw_region *swr = of_to_swr(of);
+
+	kref_put(&swr->enclave->kref, enclave_release);
+}
+
+static int gf_swr_mmap(struct kernfs_open_file *of, struct vm_area_struct *vma)
+{
+	struct ghost_sw_region *swr = of_to_swr(of);
+
+	if (vma->vm_flags & VM_WRITE)
+		return -EINVAL;
+	vma->vm_flags &= ~VM_MAYWRITE;
+
+	return ghost_region_mmap(of->file, vma, swr->header, of->kn->attr.size);
+}
+
+static struct kernfs_ops gf_ops_e_swr = {
+	.open			= gf_swr_open,
+	.release		= gf_swr_release,
+	.mmap			= gf_swr_mmap,
+};
+
+static int create_sw_region(struct kernfs_open_file *ctl_of, unsigned int id,
+			    unsigned int numa_node)
+{
+	struct ghost_enclave *e = of_to_e(ctl_of);
+	struct kernfs_node *dir, *swr_kn;
+	struct ghost_sw_region *swr;
+	char name[31];
+	int err;
+
+	dir = kernfs_find_and_get(e->enclave_dir, "sw_regions");
+	if (WARN_ON_ONCE(!dir))
+		return -EINVAL;
+
+	if (snprintf(name, sizeof(name), "sw_%u", id) >= sizeof(name)) {
+		err = -ENOSPC;
+		goto err_snprintf;
+	}
+
+	swr_kn = kernfs_create_file(dir, name, 0440, 0, &gf_ops_e_swr, e);
+	if (IS_ERR(swr_kn)) {
+		err = PTR_ERR(swr_kn);
+		goto err_create_kn;
+	}
+	/* swr_kn is inaccessible until kernfs_activate. */
+
+	swr = ghost_create_sw_region(e, id, numa_node);
+	if (IS_ERR(swr)) {
+		err = PTR_ERR(swr);
+		goto err_create_swr;
+	}
+
+	swr_kn->attr.size = swr->mmap_sz;
+	swr_kn->priv = swr;
+	kernfs_activate(swr_kn);
+
+	return 0;
+err_create_swr:
+	kernfs_remove(swr_kn);
+err_create_kn:
+err_snprintf:
+	kernfs_put(dir);
+	return err;
+}
+
+static ssize_t gf_ctl_write(struct kernfs_open_file *of, char *buf,
+			    size_t len, loff_t off)
+{
+	unsigned int arg1, arg2;
+	int err;
+
+	/*
+	 * Ignore the offset for ctl commands, so userspace doesn't have to
+	 * worry about lseeking after each command.  Userspace should submit a
+	 * single write per command too, and not write("des"), write ("troy").
+	 * Otherwise they'll fail.
+	 */
+
+	strip_slash_n(buf, len);
+
+	if (!strcmp(buf, "destroy")) {
+		destroy_enclave(of);
+	} else if (sscanf(buf, "create sw_region %u %u", &arg1, &arg2) == 2) {
+		err = create_sw_region(of, arg1, arg2);
+		if (err)
+			return err;
+	} else {
+		pr_err("%s: bad cmd :%s:", __func__, buf);
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+static long enclave_ioctl(struct ghost_enclave *e, unsigned int cmd,
+			  unsigned long arg)
+{
+	switch (cmd) {
+	case GHOST_IOC_NULL:
+		return 0;
+	case GHOST_IOC_SW_GET_INFO:
+		return ghost_sw_get_info(e,
+				(struct ghost_ioc_sw_get_info __user *)arg);
+	case GHOST_IOC_SW_FREE:
+		return ghost_sw_free(e, (void __user *)arg);
+	case GHOST_IOC_CREATE_QUEUE:
+		return ghost_create_queue(e,
+				(struct ghost_ioc_create_queue __user *)arg);
+	case GHOST_IOC_ASSOC_QUEUE:
+		return ghost_associate_queue(
+				(struct ghost_ioc_assoc_queue __user *)arg);
+	case GHOST_IOC_SET_DEFAULT_QUEUE:
+		return ghost_set_default_queue(e,
+			(struct ghost_ioc_set_default_queue __user *)arg);
+	case GHOST_IOC_CONFIG_QUEUE_WAKEUP:
+		return ghost_config_queue_wakeup(
+			(struct ghost_ioc_config_queue_wakeup __user *)arg);
+	case GHOST_IOC_GET_CPU_TIME:
+		return ghost_get_cpu_time(
+				(struct ghost_ioc_get_cpu_time __user *)arg);
+	case GHOST_IOC_COMMIT_TXN:
+		return ioctl_ghost_commit_txn(e,
+				(struct ghost_ioc_commit_txn __user *)arg);
+	case GHOST_IOC_SYNC_GROUP_TXN:
+		return ghost_sync_group(e,
+				(struct ghost_ioc_commit_txn __user *)arg);
+	case GHOST_IOC_TIMERFD_SETTIME:
+		return ghost_timerfd_settime(
+				(struct ghost_ioc_timerfd_settime __user *)arg);
+	case GHOST_IOC_RUN:
+		return ghost_run(e, (struct ghost_ioc_run __user *)arg);
+	}
+	return -ENOIOCTLCMD;
+}
+
+static long gf_ctl_ioctl(struct kernfs_open_file *of, unsigned int cmd,
+			 unsigned long arg)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	long ret;
+
+	if (!(of->file->f_mode & FMODE_WRITE))
+		return -EACCES;
+
+	/*
+	 * Active protection prevents gf_e_release from being called (and any
+	 * mmaps from being unmapped, though that doesn't apply to ctl).  Active
+	 * protection prevents the kn from being drained/deleted while we are
+	 * operating on it.  It is meant for syscalls in progress, not held
+	 * forever.  Some of these ioctls, e.g. ghost_run, can block for
+	 * arbitrarily long.
+	 *
+	 * The only thing we use the kn for is to get a stable reference to e.
+	 * We can just up the kref on our own, and ignore the kn.
+	 */
+	kref_get(&e->kref);
+	kernfs_break_active_protection(of->kn);
+	ret = enclave_ioctl(e, cmd, arg);
+	kernfs_unbreak_active_protection(of->kn);
+	kref_put(&e->kref, enclave_release);
+
+	return ret;
+}
+
+static struct kernfs_ops gf_ops_e_ctl = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_ctl_show,
+	.write			= gf_ctl_write,
+	.ioctl			= gf_ctl_ioctl,
+};
+
+/*
+ * Returns the enclave for f, if f is a ghostfs ctl file.  We could support
+ * other file types, but since this is a backdoor into the FS, we only need to
+ * support ctl.
+ *
+ * Successful callers must call ghostfs_put_ctl_enclave(f).
+ *
+ * The kernfs_ops don't need this helper.  kernfs manages the the refcounts.  We
+ * need to do it manually here, because this is is a "backdoor" function to get
+ * the enclave pointer.  That pointer is kept alive by kernfs.
+ */
+static struct ghost_enclave *ctlfd_enclave_get(struct file *f)
+{
+	struct kernfs_node *kn;
+
+	kn = kernfs_node_from_file(f);
+	if (!kn)
+		return NULL;
+	if (kernfs_type(kn) != KERNFS_FILE)
+		return NULL;
+	if (kn->attr.ops != &gf_ops_e_ctl)
+		return NULL;
+	if (!kernfs_get_active(kn))
+		return NULL;
+	WARN_ON(!kn->priv);
+	return kn->priv;
+}
+
+/* Pair this with a successful ctlfd_enclave_get() call. */
+static void ctlfd_enclave_put(struct file *f)
+{
+	struct kernfs_node *kn;
+
+	kn = kernfs_node_from_file(f);
+	if (WARN_ON(!kn))
+		return;
+	if (WARN_ON(kernfs_type(kn) != KERNFS_FILE))
+		return;
+	if (WARN_ON(kn->attr.ops != &gf_ops_e_ctl))
+		return;
+	kernfs_put_active(kn);
+}
+
+static int gf_runnable_timeout_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	seq_printf(sf, "%lld", ktime_to_ms(READ_ONCE(e->max_unscheduled)));
+	return 0;
+}
+
+static ssize_t gf_runnable_timeout_write(struct kernfs_open_file *of, char *buf,
+					 size_t len, loff_t off)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	int err;
+	unsigned long msec;
+
+	err = kstrtoul(buf, 0, &msec);
+	if (err)
+		return -EINVAL;
+
+	WRITE_ONCE(e->max_unscheduled, ms_to_ktime(msec));
+
+	return len;
+}
+
+static struct kernfs_ops gf_ops_e_runnable_timeout = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_runnable_timeout_show,
+	.write			= gf_runnable_timeout_write,
+};
+
+static int gf_switchto_disabled_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	seq_printf(sf, "%d", READ_ONCE(e->switchto_disabled));
+	return 0;
+}
+
+static ssize_t gf_switchto_disabled_write(struct kernfs_open_file *of,
+					  char *buf, size_t len, loff_t off)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	int err;
+	int tunable;
+
+	err = kstrtoint(buf, 0, &tunable);
+	if (err)
+		return -EINVAL;
+
+	WRITE_ONCE(e->switchto_disabled, !!tunable);
+
+	return len;
+}
+
+static struct kernfs_ops gf_ops_e_switchto_disabled = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_switchto_disabled_show,
+	.write			= gf_switchto_disabled_write,
+};
+
+static int gf_wake_on_waker_cpu_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	seq_printf(sf, "%d", READ_ONCE(e->wake_on_waker_cpu));
+	return 0;
+}
+
+static ssize_t gf_wake_on_waker_cpu_write(struct kernfs_open_file *of,
+					  char *buf, size_t len, loff_t off)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	int err;
+	int tunable;
+
+	err = kstrtoint(buf, 0, &tunable);
+	if (err)
+		return -EINVAL;
+
+	WRITE_ONCE(e->wake_on_waker_cpu, !!tunable);
+
+	return len;
+}
+
+static struct kernfs_ops gf_ops_e_wake_on_waker_cpu = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_wake_on_waker_cpu_show,
+	.write			= gf_wake_on_waker_cpu_write,
+};
+
+static int gf_commit_at_tick_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	seq_printf(sf, "%d", READ_ONCE(e->commit_at_tick));
+	return 0;
+}
+
+static ssize_t gf_commit_at_tick_write(struct kernfs_open_file *of, char *buf,
+				       size_t len, loff_t off)
+{
+	struct ghost_enclave *e = of_to_e(of);
+	int err;
+	int tunable;
+
+	err = kstrtoint(buf, 0, &tunable);
+	if (err)
+		return -EINVAL;
+
+	WRITE_ONCE(e->commit_at_tick, !!tunable);
+
+	return len;
+}
+
+static struct kernfs_ops gf_ops_e_commit_at_tick = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_commit_at_tick_show,
+	.write			= gf_commit_at_tick_write,
+};
+
+static int gf_status_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+	unsigned long fl;
+	bool is_active;
+	unsigned long nr_tasks;
+
+	/*
+	 * Userspace uses this to find any active enclave, since they don't have
+	 * any other methods yet to know which enclave to use.
+	 */
+	spin_lock_irqsave(&e->lock, fl);
+	/*
+	 * We don't need to lock to read agent_online, but eventually we'll
+	 * check for the presence of an interstitial scheduler too.  This status
+	 * is for the *enclave*, not the *agent*.
+	 */
+	is_active = e->agent_online;
+	nr_tasks = e->nr_tasks;
+	spin_unlock_irqrestore(&e->lock, fl);
+
+	seq_printf(sf, "version %u\n", e->abi->version);
+	seq_printf(sf, "active %s\n", is_active ? "yes" : "no");
+	seq_printf(sf, "nr_tasks %lu\n", nr_tasks);
+	return 0;
+}
+
+static struct kernfs_ops gf_ops_e_status = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_status_show,
+};
+
+static int gf_abi_version_show(struct seq_file *sf, void *v)
+{
+	struct ghost_enclave *e = seq_to_e(sf);
+
+	WARN_ON_ONCE(e->abi->version != GHOST_VERSION);
+	seq_printf(sf, "%u\n", e->abi->version);
+	return 0;
+}
+
+static struct kernfs_ops gf_ops_e_abi_version = {
+	.open			= gf_e_open,
+	.release		= gf_e_release,
+	.seq_show		= gf_abi_version_show,
+};
+
+static struct gf_dirent enclave_dirtab[] = {
+	{
+		.name		= "sw_regions",
+		.mode		= 0555,
+		.is_dir		= true,
+	},
+	{
+		.name		= "agent_online",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_agent_online,
+	},
+	{
+		.name		= "cpu_data",
+		.mode		= 0660,
+		.ops		= &gf_ops_e_cpu_data,
+	},
+	{
+		.name		= "cpulist",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_cpulist,
+	},
+	{
+		.name		= "cpumask",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_cpumask,
+	},
+	{
+		.name		= "ctl",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_ctl,
+	},
+	{
+		.name		= "runnable_timeout",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_runnable_timeout,
+	},
+	{
+		.name		= "switchto_disabled",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_switchto_disabled,
+	},
+	{
+		.name		= "wake_on_waker_cpu",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_wake_on_waker_cpu,
+	},
+	{
+		.name		= "commit_at_tick",
+		.mode		= 0664,
+		.ops		= &gf_ops_e_commit_at_tick,
+	},
+	{
+		.name		= "status",
+		.mode		= 0444,
+		.ops		= &gf_ops_e_status,
+	},
+	{
+		.name		= "abi_version",
+		.mode		= 0444,
+		.ops		= &gf_ops_e_abi_version,
+	},
+	{0},
+};
+
+/* Caller is responsible for cleanup.  Removing the parent will suffice. */
+static int gf_add_files(struct kernfs_node *parent, struct gf_dirent *dirtab,
+			struct ghost_enclave *priv)
+{
+	struct gf_dirent *gft;
+	struct kernfs_node *kn;
+
+	for (gft = dirtab; gft->name; gft++) {
+		if (gft->is_dir) {
+			kn = kernfs_create_dir(parent, gft->name, gft->mode,
+					       NULL);
+		} else {
+			kn = kernfs_create_file(parent, gft->name, gft->mode,
+						gft->size, gft->ops, priv);
+		}
+		if (IS_ERR(kn))
+			return PTR_ERR(kn);
+	}
+	return 0;
+}
+
+/*
+ * Most gf_dirent file sizes are not known at compile time.  Most don't matter
+ * for sysfs and we can leave them as 0.  But for anything that gets mmapped,
+ * it's convenient for userspace for the kernel to say how big it is.
+ */
+static void runtime_adjust_dirtabs(void)
+{
+	struct gf_dirent *enc_txn;
+
+	const loff_t GHOST_CPU_DATA_REGION_SIZE =
+		sizeof(struct ghost_cpu_data) * num_possible_cpus();
+
+	enc_txn = gf_find_file(enclave_dirtab, "cpu_data");
+	if (WARN_ON(!enc_txn))
+		return;
+	enc_txn->size = GHOST_CPU_DATA_REGION_SIZE;
+}
+
+static int __init abi_init(const struct ghost_abi *abi)
+{
+	/*
+	 * ghost bpf programs encode the ABI they were compiled against
+	 * in the upper 16 bits of 'prog->expected_attach_type' which
+	 * only works as long as GHOST_VERSION can fit within 16 bits.
+	 *
+	 * Ideally this would be in ghost_bpf_link_attach() but we cannot
+	 * include the uapi header in ghost_core.c so we check it here.
+	 */
+	BUILD_BUG_ON(GHOST_VERSION > 0xFFFF);
+
+	if (WARN_ON_ONCE(abi->version != GHOST_VERSION))
+		return -EINVAL;
+
+	runtime_adjust_dirtabs();
+	return 0;
+}
+
+static struct ghost_enclave *create_enclave(const struct ghost_abi *abi,
+					    struct kernfs_node *dir,
+					    ulong id)
+{
+	bool vmalloc_failed = false;
+	struct ghost_enclave *e;
+	int cpu, ret;
+
+	BUILD_BUG_ON(sizeof(struct ghost_cpu_data) != PAGE_SIZE);
+
+	if (WARN_ON_ONCE(abi->version != GHOST_VERSION))
+		return ERR_PTR(-EINVAL);
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (e == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	e->abi = abi;
+	spin_lock_init(&e->lock);
+	kref_init(&e->kref);
+	INIT_LIST_HEAD(&e->sw_region_list);
+	INIT_LIST_HEAD(&e->task_list);
+	INIT_LIST_HEAD(&e->inhibited_task_list);
+	INIT_LIST_HEAD(&e->ew.link);
+	INIT_WORK(&e->task_reaper, enclave_reap_tasks);
+	INIT_WORK(&e->enclave_actual_release, enclave_actual_release);
+	INIT_WORK(&e->enclave_destroyer, enclave_destroyer);
+
+	e->cpu_data = kcalloc(num_possible_cpus(),
+			      sizeof(struct ghost_cpu_data *), GFP_KERNEL);
+	if (!e->cpu_data) {
+		kfree(e);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	for_each_possible_cpu(cpu) {
+		e->cpu_data[cpu] = vmalloc_user_node_flags(PAGE_SIZE,
+							   cpu_to_node(cpu),
+							   GFP_KERNEL);
+		if (e->cpu_data[cpu] == NULL) {
+			vmalloc_failed = true;
+			break;
+		}
+	}
+
+	if (vmalloc_failed) {
+		for_each_possible_cpu(cpu)
+			vfree(e->cpu_data[cpu]);
+		kfree(e->cpu_data);
+		kfree(e);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	ret = gf_add_files(dir, enclave_dirtab, e);
+	if (ret) {
+		kref_put(&e->kref, enclave_release);
+		return ERR_PTR(ret);
+	}
+
+	e->id = id;
+	e->enclave_dir = dir;
+
+	return e;
+}
+
+/*
+ * Called at the start of every pick_next_task() via __schedule().
+ */
+static void pnt_prologue(struct rq *rq, struct task_struct *prev)
+{
+	rq->ghost.check_prev_preemption = ghost_produce_prev_msgs(rq, prev);
+
+	/* a negative 'switchto_count' indicates end of the chain */
+	rq->ghost.switchto_count = -rq->ghost.switchto_count;
+	WARN_ON_ONCE(rq->ghost.switchto_count > 0);
+	rq->ghost.pnt_bpf_once = true;
+}
+
+/*
+ * Called in the context switch path when switching from 'prev' to 'next'
+ * (either via a normal schedule or switchto).
+ */
+static void prepare_task_switch(struct rq *rq, struct task_struct *prev,
+				struct task_struct *next)
+{
+	struct ghost_status_word *agent_sw;
+
+	if (rq->ghost.agent) {
+		/*
+		 * XXX pick_next_task_fair() can return 'rq->idle' via
+		 * core_tag_pick_next_matching_rendezvous().
+		 */
+		agent_sw = rq->ghost.agent->ghost.status_word;
+		if (!task_has_ghost_policy(next) && next != rq->idle) {
+			ghost_sw_clear_flag(agent_sw, GHOST_SW_CPU_AVAIL);
+			if (rq->ghost.run_flags & NEED_CPU_NOT_IDLE) {
+				rq->ghost.run_flags &= ~NEED_CPU_NOT_IDLE;
+				ghost_need_cpu_not_idle(rq, next);
+			}
+		} else {
+			ghost_sw_set_flag(agent_sw, GHOST_SW_CPU_AVAIL);
+		}
+	}
+
+	if (!task_has_ghost_policy(prev))
+		goto done;
+
+	/* Who watches the watchmen? */
+	if (prev == rq->ghost.agent)
+		goto done;
+
+	/*
+	 * An oncpu task may switch into ghost (e.g. via a third party calling
+	 * sched_setscheduler(2)) while the rq->lock is dropped in one of the
+	 * pick_next_task handlers (e.g. during CFS idle load balancing).
+	 *
+	 * It is not possible to distinguish this in _switched_to_ghost() so
+	 * we resolve 'prev->ghost.new_task' here. Failing to do this has
+	 * dire consequences if 'prev' is runnable since it will languish
+	 * in the kernel forever (in contrast to a blocked task there is
+	 * no trigger forthcoming to produce a TASK_NEW in the future).
+	 */
+	if (unlikely(prev->ghost.new_task)) {
+		WARN_ON_ONCE(prev->ghost.yield_task);
+		WARN_ON_ONCE(prev->ghost.blocked_task);
+
+		/*
+		 * We just produced TASK_NEW so no need to consider 'prev' for
+		 * a preemption edge (see ghost_produce_prev_msgs for details).
+		 */
+		rq->ghost.check_prev_preemption = false;
+
+		prev->ghost.new_task = false;
+		ghost_task_new(rq, prev);
+		ghost_wake_agent_of(prev);
+	}
+
+	/* If we're on the ghost.tasks list, then we're runnable. */
+	if (!list_empty(&prev->ghost.run_list)) {
+		/*
+		 * Keep ghost.tasks sorted by last_runnable_at.  Whenever we set
+		 * the time, we append to the tail.
+		 */
+		list_del_init(&prev->ghost.run_list);
+		list_add_tail(&prev->ghost.run_list, &rq->ghost.tasks);
+		prev->ghost.last_runnable_at = ktime_get();
+	}
+
+	if (rq->ghost.check_prev_preemption) {
+		rq->ghost.check_prev_preemption = false;
+		ghost_task_preempted(rq, prev);
+		ghost_wake_agent_of(prev);
+	}
+
+done:
+	/*
+	 * Clear the ONCPU bit after producing the task state change msg
+	 * (e.g. preempted). This guarantees that when a task is offcpu
+	 * its 'task_barrier' is stable.
+	 */
+	if (task_has_ghost_policy(prev)) {
+		struct ghost_status_word *prev_sw = prev->ghost.status_word;
+		WARN_ON_ONCE(!(prev_sw->flags & GHOST_SW_TASK_ONCPU));
+		ghost_sw_clear_flag(prev_sw, GHOST_SW_TASK_ONCPU);
+	}
+
+	/*
+	 * CPU is switching to a non-ghost task while a task is latched.
+	 *
+	 * Treat this like latched_task preemption because we don't know when
+	 * the CPU will be available again so no point in keeping it latched.
+	 */
+	if (rq->ghost.latched_task) {
+		/*
+		 * If 'next' was returned from pick_next_task_ghost() then
+		 * 'latched_task' must have been cleared. Conversely if
+		 * there is 'latched_task' then 'next' could not have
+		 * been returned from pick_next_task_ghost().
+		 */
+		WARN_ON_ONCE(task_has_ghost_policy(next) &&
+			     !is_agent(rq, next));
+		ghost_latched_task_preempted(rq);
+
+		/*
+		 * XXX the WARN above is susceptible to a false-negative
+		 * when pick_next_task_ghost returns the idle task. This
+		 * is not the common case but it highlights that what we
+		 * really need to check is the sched_class that produced
+		 * 'next'.
+		 */
+	}
+
+	if (task_has_ghost_policy(next) && !is_agent(rq, next))
+		ghost_task_got_oncpu(rq, next);
+
+	/*
+	 * The last task in the chain scheduled (blocked/yielded/preempted).
+	 */
+	if (rq->ghost.switchto_count < 0)
+		rq->ghost.switchto_count = 0;
+}
+
+static int bpf_wake_agent(int cpu)
+{
+	return ghost_wake_agent_on_check(cpu);
+}
+
+/*
+ * Attempts to run gtid on cpu.  Returns 0 or -error.
+ *
+ * Called from BPF helpers.  The programs that can call those helpers are
+ * explicitly allowed in ghost_sched_func_proto.
+ */
+static int bpf_run_gtid(s64 gtid, u32 task_barrier, int run_flags, int cpu)
+{
+	bool check_caller_enclave = (cpu != smp_processor_id());
+
+	return __ghost_run_gtid_on(gtid, task_barrier, run_flags, cpu,
+				   check_caller_enclave);
+}
+
+static bool ghost_msg_is_valid_access(int off, int size,
+				      enum bpf_access_type type,
+				      const struct bpf_prog *prog,
+				      struct bpf_insn_access_aux *info)
+{
+	/* The verifier guarantees that size > 0. */
+	if (off < 0 || off + size > sizeof(struct bpf_ghost_msg) || off % size)
+		return false;
+
+	return true;
+}
+
+static int ghost_sched_tick_attach(struct ghost_enclave *e,
+				   struct bpf_prog *prog)
+{
+	unsigned long irq_fl;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	if (e->bpf_tick) {
+		spin_unlock_irqrestore(&e->lock, irq_fl);
+		return -EBUSY;
+	}
+	rcu_assign_pointer(e->bpf_tick, prog);
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+	return 0;
+}
+
+static void ghost_sched_tick_detach(struct ghost_enclave *e,
+				    struct bpf_prog *prog)
+{
+	unsigned long irq_fl;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	rcu_replace_pointer(e->bpf_tick, NULL, lockdep_is_held(&e->lock));
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+}
+
+static int ghost_sched_pnt_attach(struct ghost_enclave *e,
+				  struct bpf_prog *prog)
+{
+	unsigned long irq_fl;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	if (e->bpf_pnt) {
+		spin_unlock_irqrestore(&e->lock, irq_fl);
+		return -EBUSY;
+	}
+	rcu_assign_pointer(e->bpf_pnt, prog);
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+	return 0;
+}
+
+static void ghost_sched_pnt_detach(struct ghost_enclave *e,
+				   struct bpf_prog *prog)
+{
+	unsigned long irq_fl;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	rcu_replace_pointer(e->bpf_pnt, NULL, lockdep_is_held(&e->lock));
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+}
+
+static int ghost_msg_send_attach(struct ghost_enclave *e,
+				 struct bpf_prog *prog)
+{
+	unsigned long irq_fl;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	if (e->bpf_msg_send) {
+		spin_unlock_irqrestore(&e->lock, irq_fl);
+		return -EBUSY;
+	}
+	rcu_assign_pointer(e->bpf_msg_send, prog);
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+	return 0;
+}
+
+static void ghost_msg_send_detach(struct ghost_enclave *e,
+				  struct bpf_prog *prog)
+{
+	unsigned long irq_fl;
+
+	spin_lock_irqsave(&e->lock, irq_fl);
+	rcu_replace_pointer(e->bpf_msg_send, NULL, lockdep_is_held(&e->lock));
+	spin_unlock_irqrestore(&e->lock, irq_fl);
+}
+
+static int bpf_link_attach(struct ghost_enclave *e, struct bpf_prog *prog,
+			   int prog_type, int attach_type)
+{
+	int err;
+
+	switch (prog_type) {
+	case BPF_PROG_TYPE_GHOST_SCHED:
+		switch (attach_type) {
+		case BPF_GHOST_SCHED_SKIP_TICK:
+			err = ghost_sched_tick_attach(e, prog);
+			break;
+		case BPF_GHOST_SCHED_PNT:
+			err = ghost_sched_pnt_attach(e, prog);
+			break;
+		default:
+			pr_warn("bad sched bpf attach_type %d", attach_type);
+			err = -EINVAL;
+			break;
+		}
+		break;
+	case BPF_PROG_TYPE_GHOST_MSG:
+		switch (attach_type) {
+		case BPF_GHOST_MSG_SEND:
+			err = ghost_msg_send_attach(e, prog);
+			break;
+		default:
+			pr_warn("bad msg bpf attach_type %d", attach_type);
+			err = -EINVAL;
+			break;
+		}
+		break;
+	default:
+		pr_warn("bad bpf prog_type %d", prog_type);
+		err = -EINVAL;
+	}
+
+	return err;
+}
+
+static void bpf_link_detach(struct ghost_enclave *e, struct bpf_prog *prog,
+			    int prog_type, int attach_type)
+{
+	switch (prog_type) {
+	case BPF_PROG_TYPE_GHOST_SCHED:
+		switch (attach_type) {
+		case BPF_GHOST_SCHED_SKIP_TICK:
+			ghost_sched_tick_detach(e, prog);
+			break;
+		case BPF_GHOST_SCHED_PNT:
+			ghost_sched_pnt_detach(e, prog);
+			break;
+		default:
+			WARN_ONCE(1, "enclave %lu: unexpected bpf prog %d/%d",
+				  e->id, prog_type, attach_type);
+			break;
+		}
+		break;
+	case BPF_PROG_TYPE_GHOST_MSG:
+		switch (attach_type) {
+		case BPF_GHOST_MSG_SEND:
+			ghost_msg_send_detach(e, prog);
+			break;
+		default:
+			WARN_ONCE(1, "enclave %lu: unexpected bpf prog %d/%d",
+				  e->id, prog_type, attach_type);
+			break;
+		}
+		break;
+	default:
+		WARN_ONCE(1, "enclave %lu: unexpected bpf prog %d/%d",
+			  e->id, prog_type, attach_type);
+		break;
+	}
+}
+
+DEFINE_GHOST_ABI(current_abi) = {
+	.version = GHOST_VERSION,
+	.abi_init = abi_init,
+	.create_enclave = create_enclave,
+	.enclave_release = enclave_release,
+	.enclave_add_cpu = ___enclave_add_cpu,
+	.ctlfd_enclave_get = ctlfd_enclave_get,
+	.ctlfd_enclave_put = ctlfd_enclave_put,
+	.setscheduler = _ghost_setscheduler,
+	.fork = _ghost_sched_fork,
+	.cleanup_fork = _ghost_sched_cleanup_fork,
+	.wait_for_rendezvous = wait_for_rendezvous,
+	.pnt_prologue = pnt_prologue,
+	.prepare_task_switch = prepare_task_switch,
+	.tick = tick_handler,
+	.switchto = _ghost_switchto,
+	.commit_greedy_txn = _commit_greedy_txn,
+	.copy_process_epilogue = ghost_initialize_status_word,
+	.cpu_idle = cpu_idle,
+	.timerfd_triggered = _ghost_timerfd_triggered,
+	.bpf_wake_agent = bpf_wake_agent,
+	.bpf_run_gtid = bpf_run_gtid,
+	.ghost_msg_is_valid_access = ghost_msg_is_valid_access,
+	.bpf_link_attach = bpf_link_attach,
+	.bpf_link_detach = bpf_link_detach,
+
+	/* ghost_agent_sched_class callbacks */
+	.pick_next_ghost_agent = pick_next_ghost_agent,
+
+	/* ghost_sched_class callbacks */
+	.update_curr = _update_curr_ghost,
+	.prio_changed = _prio_changed_ghost,
+	.switched_to = _switched_to_ghost,
+	.switched_from = _switched_from_ghost,
+	.task_dead = _task_dead_ghost,
+	.dequeue_task = _dequeue_task_ghost,
+	.put_prev_task = _put_prev_task_ghost,
+	.enqueue_task = _enqueue_task_ghost,
+	.set_next_task = _set_next_task_ghost,
+	.task_tick = _task_tick_ghost,
+	.pick_next_task = _pick_next_task_ghost,
+	.check_preempt_curr = _check_preempt_curr_ghost,
+	.yield_task = _yield_task_ghost,
+#ifdef CONFIG_SMP
+	.balance = _balance_ghost,
+	.select_task_rq = _select_task_rq_ghost,
+	.task_woken = _task_woken_ghost,
+	.set_cpus_allowed = _set_cpus_allowed_ghost,
+#endif
+};
+
